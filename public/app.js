@@ -1,3 +1,6 @@
+
+"use strict";
+
 const socket = io();
 const $ = id => document.getElementById(id);
 
@@ -7,17 +10,21 @@ let playerId = "";
 let bank = [];
 let activeIndex = null;
 let chosen = null;
-let timer = null;
-let seconds = 0;
 let locked = false;
+let answerTimer = null;
 let sessionTimer = null;
+let seconds = 0;
+let hostToken = "";
+let playerToken = "";
+let playerName = "";
+let cameraStream = null;
 
 const screens = [
   "home", "auth", "setup", "join",
   "refDash", "playerDash", "finished"
 ];
 
-const sample = [
+const sampleQuestions = [
   {
     text: "Which organelle produces most ATP in a eukaryotic cell?",
     options: ["Mitochondrion", "Ribosome", "Golgi apparatus", "Lysosome"],
@@ -38,7 +45,8 @@ function show(id) {
 }
 
 function say(message) {
-  $("message").textContent = message || "";
+  const element = $("message");
+  if (element) element.textContent = message || "";
 }
 
 function escapeHTML(value) {
@@ -52,181 +60,244 @@ function escapeHTML(value) {
 }
 
 function stopTimers() {
-  clearInterval(timer);
+  clearInterval(answerTimer);
   clearInterval(sessionTimer);
-  timer = null;
+  answerTimer = null;
   sessionTimer = null;
+}
+
+function stopCamera() {
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(track => track.stop());
+    cameraStream = null;
+  }
+
+  const preview = $("cameraPreview");
+  if (preview) preview.srcObject = null;
+
+  if ($("cameraStatus")) {
+    $("cameraStatus").textContent = "Camera is off.";
+  }
 }
 
 function getPlayer() {
   return room?.players?.find(player => player.id === playerId);
 }
 
-function getQuestionLimit() {
-  if (Number.isInteger(Number(room?.perPlayer))) {
-    return Number(room.perPlayer);
-  }
-
-  const total = Number(room?.totalQuestions ?? room?.questions?.length ?? 0);
-  const players = Number(room?.playerCount ?? 0);
-
-  return players > 0 ? Math.floor(total / players) : 0;
+function isApproved(player) {
+  return player?.approved === true || player?.status === "approved";
 }
 
-function getAnsweredCount() {
-  const player = getPlayer();
-
-  if (!player) return 0;
-
-  if (Array.isArray(player.answeredQuestions)) {
-    return player.answeredQuestions.length;
-  }
-
-  if (Array.isArray(player.answered)) {
-    return player.answered.length;
-  }
-
-  return Number(player.answeredCount ?? 0);
+function isAnswered(question) {
+  return Boolean(question?.answered || question?.status === "answered");
 }
 
-function questionIsAnswered(question) {
+function isClaimed(question) {
   return Boolean(
-    question.answered ||
-    question.status === "answered"
+    question?.claimedBy ||
+    question?.owner ||
+    question?.status === "claimed"
   );
-}
-
-function questionIsClaimed(question) {
-  return Boolean(
-    question.claimedBy ||
-    question.owner ||
-    question.status === "claimed"
-  );
-}
-
-function questionClaimant(question) {
-  return question.claimedBy || question.owner || null;
 }
 
 function questionIsMine(question) {
-  return questionClaimant(question) === playerId;
+  return question?.claimedBy === playerId ||
+    question?.owner === playerId;
 }
 
 function canPickQuestion(question) {
-  if (role !== "player") return false;
-  if (room?.status !== "playing") return false;
-  if (activeIndex !== null) return false;
-  if (questionIsAnswered(question)) return false;
-  if (questionIsClaimed(question)) return false;
+  const player = getPlayer();
 
-  return getAnsweredCount() < getQuestionLimit();
+  return Boolean(
+    role === "player" &&
+    room?.status === "playing" &&
+    player &&
+    isApproved(player) &&
+    player.isCurrentTurn &&
+    activeIndex === null &&
+    question &&
+    !isAnswered(question) &&
+    !isClaimed(question)
+  );
+}
+
+function updateHeader() {
+  if ($("headerStatus")) {
+    $("headerStatus").textContent = room
+      ? `Room ${room.code || ""}`
+      : socket.connected ? "Connected" : "Connecting...";
+  }
+}
+
+function makeQuestion(question) {
+  return {
+    text: String(question.text || "").trim(),
+    options: Array.isArray(question.options)
+      ? question.options.slice(0, 4).map(value => String(value || "").trim())
+      : ["", "", "", ""],
+    correct: String(question.correct || "A").toUpperCase()
+  };
+}
+
+function validateQuestion(question, index) {
+  if (!question.text.trim()) {
+    return `Question ${index + 1} needs question text.`;
+  }
+
+  if (
+    question.options.length !== 4 ||
+    question.options.some(option => !option.trim())
+  ) {
+    return `Question ${index + 1} needs all four answer options.`;
+  }
+
+  if (!["A", "B", "C", "D"].includes(question.correct)) {
+    return `Question ${index + 1} needs a correct answer from A to D.`;
+  }
+
+  return "";
+}
+
+function emitWithAck(event, payload, successMessage) {
+  socket.emit(event, payload, response => {
+    if (!response?.ok) {
+      say(response?.error || "The action could not be completed.");
+      return;
+    }
+
+    if (successMessage) say(successMessage);
+  });
 }
 
 /* -------------------------------------------------
-   HOME AND REFEREE AUTHENTICATION
+   HOME AND REFEREE LOGIN
 -------------------------------------------------- */
 
-$("refStart").onclick = () => {
+$("refStart")?.addEventListener("click", () => {
   say("");
   show("auth");
-};
+});
 
-$("playerStart").onclick = () => {
+$("playerStart")?.addEventListener("click", () => {
   say("");
   show("join");
-};
+});
 
-$("backHome").onclick = $("backHome2").onclick = () => {
+function goHome() {
+  stopTimers();
+  stopCamera();
+
+  room = null;
+  role = "";
+  playerId = "";
+  activeIndex = null;
+  chosen = null;
+  locked = false;
+
   say("");
+  updateHeader();
   show("home");
-};
+}
 
-$("authBtn").onclick = () => {
-  if ($("password").value !== "1144") {
-    return say("Incorrect demo password.");
+$("backHome")?.addEventListener("click", goHome);
+$("backHome2")?.addEventListener("click", goHome);
+$("homeBtn")?.addEventListener("click", goHome);
+
+$("authBtn")?.addEventListener("click", () => {
+  // This is only a demonstration gate, not secure authentication.
+  if ($("password")?.value !== "1144") {
+    say("Incorrect demo password.");
+    return;
   }
 
-  bank = sample.map(question => ({
-    ...question,
-    options: [...question.options]
-  }));
-
+  bank = sampleQuestions.map(makeQuestion);
   drawBank();
   say("");
   show("setup");
-};
+});
 
 /* -------------------------------------------------
-   QUESTION BANK EDITING
+   QUESTION BANK
 -------------------------------------------------- */
 
 function drawBank() {
-  $("bank").innerHTML = "";
+  const container = $("bank");
+  if (!container) return;
+
+  container.innerHTML = "";
 
   bank.forEach((question, index) => {
     const entry = document.createElement("div");
     entry.className = "entry";
 
     entry.innerHTML = `
+      <div class="between">
+        <b>Question ${index + 1}</b>
+        <button type="button" class="secondary remove-question">
+          Remove
+        </button>
+      </div>
+
       <label>
-        Question ${index + 1}
+        Question text
         <textarea class="question-text" rows="2"></textarea>
       </label>
 
       <div class="grid">
-        ${question.options.map((option, optionIndex) => `
+        ${["A", "B", "C", "D"].map((letter, optionIndex) => `
           <label>
-            Option ${String.fromCharCode(65 + optionIndex)}
+            Option ${letter}
             <input class="question-option" data-option="${optionIndex}">
           </label>
         `).join("")}
       </div>
 
       <label>
-        Correct option (A-D)
-        <input class="question-correct" maxlength="1">
+        Correct option
+        <select class="question-correct">
+          <option value="A">A</option>
+          <option value="B">B</option>
+          <option value="C">C</option>
+          <option value="D">D</option>
+        </select>
       </label>
-
-      <button type="button" class="secondary remove-question">
-        Remove question
-      </button>
     `;
 
     entry.querySelector(".question-text").value = question.text;
+
+    entry.querySelector(".question-text").addEventListener("input", event => {
+      question.text = event.target.value;
+    });
 
     entry.querySelectorAll(".question-option").forEach(input => {
       const optionIndex = Number(input.dataset.option);
       input.value = question.options[optionIndex] || "";
 
-      input.oninput = event => {
+      input.addEventListener("input", event => {
         question.options[optionIndex] = event.target.value;
-      };
+      });
     });
 
-    entry.querySelector(".question-text").oninput = event => {
-      question.text = event.target.value;
-    };
+    entry.querySelector(".question-correct").value = question.correct;
 
-    const correctInput = entry.querySelector(".question-correct");
-    correctInput.value = question.correct || "A";
+    entry.querySelector(".question-correct").addEventListener("change", event => {
+      question.correct = event.target.value;
+    });
 
-    correctInput.oninput = event => {
-      question.correct = event.target.value.toUpperCase();
-    };
-
-    entry.querySelector(".remove-question").onclick = () => {
+    entry.querySelector(".remove-question").addEventListener("click", () => {
       bank.splice(index, 1);
       drawBank();
-      updateQuestionDistribution();
-    };
+    });
 
-    $("bank").appendChild(entry);
+    container.appendChild(entry);
   });
 
-  updateQuestionDistribution();
+  if ($("bankCount")) {
+    $("bankCount").textContent = `${bank.length} questions in your bank.`;
+  }
 }
 
-$("addQuestion").onclick = () => {
+$("addQuestion")?.addEventListener("click", () => {
   bank.push({
     text: "",
     options: ["", "", "", ""],
@@ -234,219 +305,209 @@ $("addQuestion").onclick = () => {
   });
 
   drawBank();
-};
+});
 
 /* -------------------------------------------------
-   QUESTION DISTRIBUTION
+   QUESTION GENERATION
 -------------------------------------------------- */
 
-function updateQuestionDistribution() {
-  const playerCount = Number($("playerCount").value);
-  const totalQuestions = Number($("totalQuestions").value);
+$("generateQuestions")?.addEventListener("click", () => {
+  const status = $("generationStatus");
 
-  const display = $("questionDistribution");
-
-  if (!display) return;
-
-  if (
-    !Number.isInteger(playerCount) ||
-    !Number.isInteger(totalQuestions) ||
-    playerCount < 1 ||
-    totalQuestions < 1
-  ) {
-    display.textContent = "Enter a valid student count and question total.";
-    return;
+  if (status) {
+    status.textContent =
+      "Automatic AI generation is not connected yet. You can add or edit questions in the question bank below.";
   }
 
-  if (totalQuestions % playerCount !== 0) {
-    display.textContent =
-      `${totalQuestions} questions cannot be divided equally among ` +
-      `${playerCount} students. Please adjust the total.`;
-    return;
-  }
-
-  const limit = totalQuestions / playerCount;
-
-  display.textContent =
-    `Each student can answer a maximum of ${limit} questions. ` +
-    `All students will see the full question bank and may choose ` +
-    `available questions in any order.`;
-}
-
-$("playerCount").addEventListener("input", updateQuestionDistribution);
-$("totalQuestions").addEventListener("input", updateQuestionDistribution);
+  say(
+    "The question-generation service has not been connected yet. " +
+    "Your selected topic and uploaded material are not processed by this prototype."
+  );
+});
 
 /* -------------------------------------------------
    CREATE ROOM
 -------------------------------------------------- */
 
-$("createRoom").onclick = () => {
-  const playerCount = Number($("playerCount").value);
-  const totalQuestions = Number($("totalQuestions").value);
+$("createRoom")?.addEventListener("click", () => {
+  const playerCount = Number($("playerCount")?.value);
+  const roomName = $("roomName")?.value.trim();
+  const code = $("accessCode")?.value.trim().toUpperCase();
 
   if (!Number.isInteger(playerCount) || playerCount < 1) {
-    return say("Enter a valid number of students.");
+    say("Enter a valid number of players.");
+    return;
   }
 
-  if (!Number.isInteger(totalQuestions) || totalQuestions < 1) {
-    return say("Enter a valid total number of questions.");
+  if (!roomName || !code) {
+    say("Enter a group name and room access code.");
+    return;
   }
 
-  if (totalQuestions % playerCount !== 0) {
-    return say("The total number of questions must divide evenly among the students.");
+  if (bank.length < 1) {
+    say("Add at least one question before creating the room.");
+    return;
   }
 
-  if (bank.length !== totalQuestions) {
-    return say(
-      `Your question bank contains ${bank.length} questions. ` +
-      `Please add or remove questions until it contains exactly ${totalQuestions}.`
-    );
-  }
-
-  for (let i = 0; i < bank.length; i++) {
-    const question = bank[i];
-
-    if (!question.text.trim()) {
-      return say(`Question ${i + 1} needs question text.`);
-    }
-
-    if (question.options.length !== 4 || question.options.some(option => !option.trim())) {
-      return say(`Question ${i + 1} needs all four answer options.`);
-    }
-
-    if (!["A", "B", "C", "D"].includes(question.correct)) {
-      return say(`Question ${i + 1} needs a correct answer from A to D.`);
+  for (let index = 0; index < bank.length; index++) {
+    const error = validateQuestion(bank[index], index);
+    if (error) {
+      say(error);
+      return;
     }
   }
 
   const payload = {
-    name: $("roomName").value.trim(),
-    code: $("accessCode").value.trim().toUpperCase(),
+    name: roomName,
+    code,
     playerCount,
-    totalQuestions,
-    perPlayer: totalQuestions / playerCount,
-    duration: Number($("duration").value),
-    pickTime: Number($("pickTime").value),
-    explainTime: Number($("explainTime").value),
-    autoStart: $("autoStart").checked,
-    questions: bank.map(question => ({
-      text: question.text.trim(),
-      options: question.options.map(option => option.trim()),
-      correct: question.correct
-    }))
+    duration: Number($("duration")?.value || 30),
+    pickTime: Number($("pickTime")?.value || 60),
+    explainTime: Number($("explainTime")?.value || 120),
+    autoStart: Boolean($("autoStart")?.checked),
+    questions: bank.map(makeQuestion)
   };
-
-  if (!payload.name || !payload.code) {
-    return say("Enter a group name and player access code.");
-  }
 
   say("Creating your room...");
 
   socket.emit("room:create", payload, response => {
     if (!response?.ok) {
-      return say(response?.error || "Unable to create the room.");
+      say(response?.error || "Unable to create the room.");
+      return;
     }
 
     room = response.room;
     role = "host";
+    hostToken = response.hostToken || "";
 
-    $("headerStatus").textContent = "Room " + room.code;
-    $("dashName").textContent = room.name;
-    $("shareCode").textContent = room.code;
-    $("roomId").textContent = room.id;
+    if (hostToken) {
+      localStorage.setItem("classroomArenaHostToken", hostToken);
+      localStorage.setItem("classroomArenaHostRoomId", room.id);
+    }
 
+    $("dashName").textContent = room.name || "";
+    $("shareCode").textContent = room.code || "";
+    $("roomId").textContent = room.id || "";
+
+    updateHeader();
     say("");
     show("refDash");
     renderRoom(room);
   });
-};
+});
 
 /* -------------------------------------------------
    PLAYER JOIN AND RESUME
 -------------------------------------------------- */
 
-$("joinBtn").onclick = () => {
-  const name = $("playerName").value.trim();
-  const code = $("joinCode").value.trim().toUpperCase();
+$("joinBtn")?.addEventListener("click", () => {
+  playerName = $("playerName")?.value.trim() || "";
+  const code = $("joinCode")?.value.trim().toUpperCase() || "";
 
-  if (!name || !code) {
-    return say("Enter your name and the room access code.");
+  if (!playerName || !code) {
+    say("Enter your name and the room access code.");
+    return;
   }
+
+  if ($("cameraConsent") && !$("cameraConsent").checked) {
+    say("Please confirm that you understand the camera requirements before joining.");
+    return;
+  }
+
+  const savedToken = localStorage.getItem("classroomArenaPlayerToken") || "";
 
   say("Requesting to join the room...");
 
-  socket.emit("room:join", { code, name }, response => {
+  socket.emit("room:join", {
+    code,
+    name: playerName,
+    resumeToken: savedToken || undefined
+  }, response => {
     if (!response?.ok) {
-      return say(response?.error || "Unable to join the room.");
+      say(response?.error || "Unable to join the room.");
+      return;
     }
 
     room = response.room;
     role = "player";
     playerId = response.playerId;
+    playerToken = response.resumeToken || "";
 
-    $("playerRoom").textContent = room.name;
-    $("playerRoomId").textContent = room.id;
-    $("playerIdentity").textContent = name;
+    if (playerToken) {
+      localStorage.setItem("classroomArenaPlayerToken", playerToken);
+      localStorage.setItem("classroomArenaPlayerRoomCode", code);
+      localStorage.setItem("classroomArenaPlayerName", playerName);
+    }
 
-    $("headerStatus").textContent = "Room " + room.code;
+    $("playerRoom").textContent = room.name || "";
+    $("playerRoomId").textContent = room.id || "";
+    $("playerIdentity").textContent = playerName;
 
+    updateHeader();
     say("");
     show("playerDash");
     renderRoom(room);
   });
-};
+});
 
 /* -------------------------------------------------
-   REFEREE CONTROLS
+   REFEREE RESUME
 -------------------------------------------------- */
 
-$("endSession").onclick = () => {
+function attemptHostResume() {
+  const savedRoomId = localStorage.getItem("classroomArenaHostRoomId");
+  const savedToken = localStorage.getItem("classroomArenaHostToken");
+
+  if (!savedRoomId || !savedToken) return;
+
+  socket.emit("host:resume", {
+    roomId: savedRoomId,
+    hostToken: savedToken
+  }, response => {
+    if (!response?.ok || !response.room) return;
+
+    room = response.room;
+    role = "host";
+    hostToken = savedToken;
+
+    $("dashName").textContent = room.name || "";
+    $("shareCode").textContent = room.code || "";
+    $("roomId").textContent = room.id || "";
+
+    updateHeader();
+    show("refDash");
+    renderRoom(room);
+  });
+}
+
+/* -------------------------------------------------
+   REFEREE ROOM CONTROLS
+-------------------------------------------------- */
+
+$("startNow")?.addEventListener("click", () => {
+  if (!room) return;
+
+  emitWithAck("host:start", {
+    roomId: room.id
+  });
+});
+
+$("endSession")?.addEventListener("click", () => {
   if (!room) return;
 
   if (!confirm("Are you sure you want to end this session?")) return;
 
-  socket.emit("host:end", { roomId: room.id }, response => {
-    if (!response?.ok) {
-      return say(response?.error || "Unable to end the session.");
-    }
+  emitWithAck("host:end", {
+    roomId: room.id
   });
-};
-
-if ($("startNow")) {
-  $("startNow").onclick = () => {
-    if (!room) return;
-
-    socket.emit("host:start", { roomId: room.id }, response => {
-      if (!response?.ok) {
-        say(response?.error || "The session could not be started.");
-      }
-    });
-  };
-}
-
-$("homeBtn").onclick = () => {
-  stopTimers();
-  room = null;
-  role = "";
-  playerId = "";
-  activeIndex = null;
-  show("home");
-};
-
-/* -------------------------------------------------
-   REFEREE PLAYER APPROVAL AND KICKING
--------------------------------------------------- */
+});
 
 window.approvePlayer = player => {
   if (!room) return;
 
-  socket.emit("host:approve", {
+  emitWithAck("host:approve", {
     roomId: room.id,
     playerId: player
-  }, response => {
-    if (!response?.ok) {
-      say(response?.error || "Unable to approve player.");
-    }
   });
 };
 
@@ -455,15 +516,92 @@ window.kickPlayer = player => {
 
   if (!confirm("Remove this player from the room?")) return;
 
-  socket.emit("host:kick", {
+  emitWithAck("host:kick", {
     roomId: room.id,
     playerId: player
-  }, response => {
-    if (!response?.ok) {
-      say(response?.error || "Unable to remove player.");
-    }
   });
 };
+
+/* -------------------------------------------------
+   REFEREE QUESTION EDITING
+-------------------------------------------------- */
+
+function updateRoomQuestionBank() {
+  if (!room || role !== "host") return;
+
+  const questions = bank.map(makeQuestion);
+
+  for (let index = 0; index < questions.length; index++) {
+    const error = validateQuestion(questions[index], index);
+    if (error) {
+      say(error);
+      return;
+    }
+  }
+
+  emitWithAck("host:questions:update", {
+    roomId: room.id,
+    questions
+  }, "Question bank updated.");
+}
+
+function addQuestionToLiveRoom() {
+  if (!room || role !== "host") return;
+
+  const question = {
+    text: "New question",
+    options: ["Option A", "Option B", "Option C", "Option D"],
+    correct: "A"
+  };
+
+  emitWithAck("host:question:add", {
+    roomId: room.id,
+    question
+  });
+}
+
+window.editRoomQuestion = (index, question) => {
+  if (!room || role !== "host") return;
+
+  emitWithAck("host:question:edit", {
+    roomId: room.id,
+    index,
+    question: makeQuestion(question)
+  });
+};
+
+window.deleteRoomQuestion = index => {
+  if (!room || role !== "host") return;
+
+  if (!confirm("Delete this question from the room?")) return;
+
+  emitWithAck("host:question:delete", {
+    roomId: room.id,
+    index
+  });
+};
+
+/* -------------------------------------------------
+   END SESSION AND HOME
+-------------------------------------------------- */
+
+function finishRoom(updatedRoom) {
+  stopTimers();
+  stopCamera();
+
+  show("finished");
+
+  const players = (updatedRoom.players || [])
+    .slice()
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+
+  $("results").innerHTML = players.map((player, index) => `
+    <p>
+      <b>${index + 1}. ${escapeHTML(player.name)}</b>
+      — ${Number(player.score || 0)} points
+    </p>
+  `).join("") || "<p>No results available.</p>";
+}
 
 /* -------------------------------------------------
    ROOM DISPLAY
@@ -473,22 +611,10 @@ function renderRoom(updatedRoom) {
   if (!updatedRoom) return;
 
   room = updatedRoom;
+  updateHeader();
 
   if (room.status === "finished") {
-    stopTimers();
-    show("finished");
-
-    $("results").innerHTML = (room.players || [])
-      .slice()
-      .sort((a, b) => (b.score || 0) - (a.score || 0))
-      .map(player => `
-        <p>
-          ${escapeHTML(player.name)} —
-          ${Number(player.score || 0)} points
-        </p>
-      `)
-      .join("");
-
+    finishRoom(room);
     return;
   }
 
@@ -506,76 +632,121 @@ function renderRoom(updatedRoom) {
 function renderRefereeDashboard() {
   show("refDash");
 
-  $("dashName").textContent = room.name;
-  $("shareCode").textContent = room.code;
-  $("roomId").textContent = room.id;
+  $("dashName").textContent = room.name || "";
+  $("shareCode").textContent = room.code || "";
+  $("roomId").textContent = room.id || "";
 
   const players = room.players || [];
 
   $("monitor").innerHTML = players.map(player => {
-    const approved = player.approved === true || player.status === "approved";
+    const approved = isApproved(player);
+    const connection = player.connected ? "Connected" : "Disconnected";
 
     return `
       <div class="entry">
-        <b>${escapeHTML(player.name)}</b>
-
-        <span class="score">
-          ${Number(player.score || 0)} pts
-        </span>
+        <div class="between">
+          <b>${escapeHTML(player.name)}</b>
+          <b>${Number(player.score || 0)} pts</b>
+        </div>
 
         <p>
           Approval: ${approved ? "Approved" : "Waiting for approval"}
-          · Connection: ${escapeHTML(player.connection || player.online || "Unknown")}
+          · Connection: ${connection}
         </p>
 
         <p>
-          Questions answered:
-          ${Number(player.answeredCount || player.answered || 0)}
-          / ${getQuestionLimit()}
+          Questions answered: ${Number(player.answeredCount || 0)}
         </p>
 
         ${!approved ? `
-          <button onclick="approvePlayer('${player.id}')">
+          <button onclick="approvePlayer('${escapeHTML(player.id)}')">
             Approve player
           </button>
         ` : ""}
 
-        <button class="secondary" onclick="kickPlayer('${player.id}')">
+        <button class="secondary" onclick="kickPlayer('${escapeHTML(player.id)}')">
           Remove player
         </button>
       </div>
     `;
   }).join("") || "<p>No players have joined yet.</p>";
 
-  const ready =
-    players.length === Number(room.playerCount) &&
-    players.every(player =>
-      player.approved === true || player.status === "approved"
-    );
+  const ready = players.length === Number(room.playerCount) &&
+    players.every(isApproved);
 
   if ($("startNow")) {
-    $("startNow").disabled =
-      room.status !== "lobby" || !ready;
+    $("startNow").disabled = room.status !== "lobby" || !ready;
   }
 
-  $("sessionClock").textContent =
-    room.status === "playing"
-      ? "In progress"
-      : room.status === "lobby"
-        ? "Waiting for players"
-        : room.status;
+  if ($("sessionClock")) {
+    $("sessionClock").textContent =
+      room.status === "playing" ? "In progress" :
+      room.status === "lobby" ? "Waiting for players" :
+      room.status;
+  }
 
+  renderPlayerProfiles();
   renderMarkingPanel();
+  startSessionClock();
 }
 
 /* -------------------------------------------------
-   REFEREE MARKING PANEL
+   REFEREE PLAYER PROFILES
+-------------------------------------------------- */
+
+function renderPlayerProfiles() {
+  const container = $("playerProfiles");
+  if (!container) return;
+
+  container.innerHTML = (room.players || []).map(player => {
+    const history = Array.isArray(player.history) ? player.history : [];
+
+    return `
+      <div class="entry">
+        <div class="between">
+          <b>${escapeHTML(player.name)}</b>
+          <b>${Number(player.score || 0)} points</b>
+        </div>
+
+        <p>
+          Connection: ${player.connected ? "Connected" : "Disconnected"}
+        </p>
+
+        <p>
+          Questions answered: ${Number(player.answeredCount || 0)}
+        </p>
+
+        <h3>Activity history</h3>
+
+        ${history.map(item => `
+          <div class="entry">
+            <b>Question ${Number(item.questionIndex ?? 0) + 1}</b>
+            <p>${escapeHTML(item.question || "")}</p>
+            <p>Answer: ${escapeHTML(item.answer || "Not submitted")}</p>
+            <p>Explanation: ${escapeHTML(item.feedback || "None")}</p>
+            <p>Marks: ${Number(item.marks || 0)}</p>
+          </div>
+        `).join("") || "<p>No activity recorded yet.</p>"}
+
+        <p class="hint">
+          Webcam recording is not connected in this version.
+        </p>
+      </div>
+    `;
+  }).join("") || "<p>No player profiles yet.</p>";
+}
+
+/* -------------------------------------------------
+   REFEREE MARKING AND ANSWER OVERRIDES
 -------------------------------------------------- */
 
 function renderMarkingPanel() {
+  const container = $("marking");
+  if (!container) return;
+
   const submissions = room.submissions || [];
 
-  $("marking").innerHTML = submissions.map((submission, index) => `
+  container.innerHTML = submissions.map(submission => `
     <div class="entry">
       <b>
         ${escapeHTML(submission.name)}
@@ -583,52 +754,78 @@ function renderMarkingPanel() {
       </b>
 
       <p>${escapeHTML(submission.question)}</p>
-
-      <p>
-        Answer:
-        ${escapeHTML(submission.answer || "Not provided")}
-      </p>
-
-      <p>
-        Explanation:
-        ${escapeHTML(submission.feedback || "None")}
-      </p>
+      <p>Answer selected: ${escapeHTML(submission.answer || "Not provided")}</p>
+      <p>Explanation: ${escapeHTML(submission.feedback || "None")}</p>
+      <p>Current result: ${submission.isCorrect ? "Correct" : "Incorrect"}</p>
 
       <label>
         Marks
         <input
-          id="mark${index}"
           type="number"
           min="0"
+          step="0.5"
+          id="marks-${escapeHTML(submission.id)}"
           value="${Number(submission.marks || 0)}"
         >
       </label>
 
-      <button onclick="markPlayer('${submission.playerId}', ${index})">
-        Save marks
-      </button>
+      <label>
+        Correct answer override
+        <select id="correct-${escapeHTML(submission.id)}">
+          ${["A", "B", "C", "D"].map(letter => `
+            <option
+              value="${letter}"
+              ${submission.correct === letter ? "selected" : ""}
+            >${letter}</option>
+          `).join("")}
+        </select>
+      </label>
+
+      <div class="actions">
+        <button onclick="saveMarks('${escapeHTML(submission.id)}')">
+          Save marks
+        </button>
+
+        <button class="secondary" onclick="overrideAnswer('${escapeHTML(submission.id)}')">
+          Save correct answer
+        </button>
+      </div>
     </div>
   `).join("") || "<p>No submissions yet.</p>";
 }
 
-window.markPlayer = (id, index) => {
+window.saveMarks = submissionId => {
   if (!room) return;
 
-  const marks = Number($("mark" + index).value);
+  const marks = Number($(`marks-${submissionId}`)?.value);
 
   if (!Number.isFinite(marks) || marks < 0) {
-    return say("Enter a valid mark.");
+    say("Enter a valid mark.");
+    return;
   }
 
-  socket.emit("host:mark", {
+  emitWithAck("host:mark", {
     roomId: room.id,
-    playerId: id,
+    submissionId,
     marks
-  }, response => {
-    if (!response?.ok) {
-      say(response?.error || "Unable to save marks.");
-    }
-  });
+  }, "Marks saved.");
+};
+
+window.overrideAnswer = submissionId => {
+  if (!room) return;
+
+  const correct = $(`correct-${submissionId}`)?.value;
+
+  if (!["A", "B", "C", "D"].includes(correct)) {
+    say("Choose a valid correct answer.");
+    return;
+  }
+
+  emitWithAck("host:answer:override", {
+    roomId: room.id,
+    submissionId,
+    correct
+  }, "Correct answer updated.");
 };
 
 /* -------------------------------------------------
@@ -645,43 +842,60 @@ function renderPlayerDashboard() {
     return;
   }
 
-  const limit = getQuestionLimit();
-  const answered = getAnsweredCount();
+  $("playerRoom").textContent = room.name || "";
+  $("playerRoomId").textContent = room.id || "";
+  $("playerIdentity").textContent = player.name || playerName;
 
-  $("playerRoom").textContent = room.name;
-  $("playerQuestionLimit").textContent =
-    `Your maximum: ${limit} questions. Answered: ${answered}/${limit}.`;
-
-  const approved =
-    player.approved === true || player.status === "approved";
-
-  if (!approved) {
+  if (!isApproved(player)) {
     $("phase").textContent =
-      "Your request has been sent. Please wait for the referee to approve you.";
+      "Your request has been sent. Please wait for referee approval.";
   } else if (room.status === "lobby") {
     $("phase").textContent =
-      "You have been approved. Waiting for the referee to start the session.";
+      "You have been approved. Waiting for the referee to start.";
+  } else if (room.status === "playing" && player.isCurrentTurn) {
+    $("phase").textContent =
+      "It is your turn. Choose any available question.";
   } else if (room.status === "playing") {
     $("phase").textContent =
-      "Session is active. Choose any available question.";
+      "Please wait. Another player is taking their turn.";
   } else {
-    $("phase").textContent = "Session status: " + room.status;
+    $("phase").textContent = `Session status: ${room.status}`;
+  }
+
+  if ($("playerProgress")) {
+    $("playerProgress").textContent =
+      `Questions answered: ${Number(player.answeredCount || 0)}`;
+  }
+
+  if ($("playerQuestionLimit")) {
+    $("playerQuestionLimit").textContent =
+      "There is no individual question quota. Choose from the available bank when it is your turn.";
+  }
+
+  if ($("turnIndicator")) {
+    $("turnIndicator").textContent = player.isCurrentTurn
+      ? "YOUR TURN"
+      : "WAITING FOR YOUR TURN";
   }
 
   renderQuestionTiles();
   renderLeaderboard();
+  startSessionClock();
 }
 
 /* -------------------------------------------------
-   FULL QUESTION BANK FOR EVERY PLAYER
+   QUESTION BOARD
 -------------------------------------------------- */
 
 function renderQuestionTiles() {
+  const container = $("tiles");
+  if (!container) return;
+
   const questions = room.questions || [];
 
-  $("tiles").innerHTML = questions.map((question, index) => {
-    const answered = questionIsAnswered(question);
-    const claimed = questionIsClaimed(question);
+  container.innerHTML = questions.map((question, index) => {
+    const answered = isAnswered(question);
+    const claimed = isClaimed(question);
     const mine = questionIsMine(question);
 
     let label = `Question ${index + 1}`;
@@ -713,41 +927,15 @@ function renderQuestionTiles() {
   }).join("");
 }
 
-/* -------------------------------------------------
-   LEADERBOARD
--------------------------------------------------- */
-
-function renderLeaderboard() {
-  const players = (room.players || [])
-    .slice()
-    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
-
-  $("leaderboard").innerHTML = players.map((player, index) => `
-    <p>
-      ${index + 1}. ${escapeHTML(player.name)}
-      <b class="score">${Number(player.score || 0)} pts</b>
-    </p>
-  `).join("") || "<p>No scores yet.</p>";
-}
-
-/* -------------------------------------------------
-   PICK A QUESTION
--------------------------------------------------- */
-
 window.pickQuestion = index => {
   if (!room || activeIndex !== null) return;
 
-  const question = room.questions[index];
-
-  if (!question) return;
+  const question = room.questions?.[index];
 
   if (!canPickQuestion(question)) {
-    return say("This question is unavailable, or you have reached your question limit.");
+    say("This question is unavailable, or it is not your turn.");
+    return;
   }
-
-  activeIndex = index;
-  chosen = null;
-  locked = false;
 
   say("Claiming question...");
 
@@ -756,18 +944,21 @@ window.pickQuestion = index => {
     index
   }, response => {
     if (!response?.ok) {
-      activeIndex = null;
       say(response?.error || "This question is no longer available.");
-      renderRoom(room);
       return;
     }
 
     if (response.room) room = response.room;
 
+    activeIndex = index;
+    chosen = null;
+    locked = false;
     seconds = Number(room.pickTime || 60);
+
     say("");
     drawQuestion();
-    startClock();
+    startAnswerClock();
+    renderQuestionTiles();
   });
 };
 
@@ -776,9 +967,8 @@ window.pickQuestion = index => {
 -------------------------------------------------- */
 
 function drawQuestion() {
-  const question = room.questions[activeIndex];
-
-  if (!question) return;
+  const question = room?.questions?.[activeIndex];
+  if (!question || !$("questionArea")) return;
 
   $("questionArea").innerHTML = `
     <div class="entry">
@@ -805,7 +995,8 @@ function drawQuestion() {
       <div id="explain" class="hidden">
         <label>
           Optional explanation
-          <textarea id="feedback" rows="3"></textarea>
+          <textarea id="feedback" rows="3"
+            placeholder="You may explain your answer, or leave this blank."></textarea>
         </label>
 
         <button id="submit">Submit answer</button>
@@ -813,31 +1004,30 @@ function drawQuestion() {
     </div>
   `;
 
-  $("lock").onclick = lockAnswer;
-  $("submit").onclick = submitAnswer;
+  $("lock").addEventListener("click", lockAnswer);
+  $("submit").addEventListener("click", submitAnswer);
 }
 
 /* -------------------------------------------------
-   ANSWER SELECTION TIMER
+   ANSWER TIMER
 -------------------------------------------------- */
 
-function startClock() {
-  clearInterval(timer);
+function startAnswerClock() {
+  clearInterval(answerTimer);
 
-  timer = setInterval(() => {
-    seconds--;
+  answerTimer = setInterval(() => {
+    seconds = Math.max(0, seconds - 1);
 
-    const clock = $("clock");
-
-    if (clock) {
-      clock.textContent = `${seconds}s`;
+    if ($("clock")) {
+      $("clock").textContent = `${seconds}s`;
     }
 
     if (seconds <= 0) {
-      clearInterval(timer);
+      clearInterval(answerTimer);
+      answerTimer = null;
 
       if (!locked) {
-        lockAnswer(true);
+        say("Your answer-selection time has expired. Select and lock an answer if the session still permits it.");
       } else {
         submitAnswer();
       }
@@ -849,166 +1039,243 @@ function startClock() {
    LOCK ANSWER
 -------------------------------------------------- */
 
-function lockAnswer(timeExpired = false) {
+function lockAnswer() {
   if (locked || activeIndex === null) return;
 
   chosen = document.querySelector(
     'input[name="answer"]:checked'
   )?.value;
 
-  if (!chosen && !timeExpired) {
-    return say("Choose an option first.");
-  }
-
-  if (!chosen && timeExpired) {
-    return say("Your selection time expired without an answer.");
+  if (!chosen) {
+    say("Choose an option before locking your answer.");
+    return;
   }
 
   socket.emit("player:lock", {
     roomId: room.id,
-    answer: chosen,
-    index: activeIndex
+    answer: chosen
   }, response => {
     if (!response?.ok) {
-      return say(response?.error || "Unable to lock your answer.");
+      say(response?.error || "Unable to lock your answer.");
+      return;
     }
 
     locked = true;
-    clearInterval(timer);
-
-    $("explain").classList.remove("hidden");
-    $("lock").disabled = true;
+    clearInterval(answerTimer);
 
     document.querySelectorAll('input[name="answer"]').forEach(input => {
       input.disabled = true;
     });
 
-    seconds = Number(room.explainTime || 120);
-    $("clock").textContent = `${seconds}s`;
+    $("lock").disabled = true;
+    $("explain").classList.remove("hidden");
 
-    startClock();
+    seconds = Number(room.explainTime || 120);
+
+    if ($("clock")) $("clock").textContent = `${seconds}s`;
+
+    say("Answer locked. You may submit now, with or without an explanation.");
+    startAnswerClock();
   });
 }
 
 /* -------------------------------------------------
-   SUBMIT FINAL ANSWER
+   SUBMIT ANSWER
 -------------------------------------------------- */
 
 function submitAnswer() {
-  if (activeIndex === null) return;
+  if (activeIndex === null || !locked) return;
 
-  clearInterval(timer);
+  clearInterval(answerTimer);
+  answerTimer = null;
+
+  const feedback = $("feedback")?.value || "";
 
   socket.emit("player:submit", {
     roomId: room.id,
-    feedback: $("feedback")?.value || ""
+    feedback
   }, response => {
     if (!response?.ok) {
-      return say(response?.error || "Unable to submit your answer.");
+      say(response?.error || "Unable to submit your answer.");
+      return;
     }
 
     activeIndex = null;
     chosen = null;
     locked = false;
 
-    $("questionArea").innerHTML =
-      "<p>Your answer has been submitted and locked.</p>";
+    if ($("questionArea")) {
+      $("questionArea").innerHTML =
+        "<p>Your answer has been submitted and locked.</p>";
+    }
 
-    say("Answer submitted successfully.");
-
-    socket.emit("room:resume", {
-      roomId: room.id
-    }, result => {
-      if (result?.ok) {
-        room = result.room;
-        renderRoom(room);
-      }
-    });
+    say("Answer submitted successfully. Please wait for your next turn.");
   });
 }
 
 /* -------------------------------------------------
-   SESSION TIMER DISPLAY
+   LEADERBOARD
+-------------------------------------------------- */
+
+function renderLeaderboard() {
+  const container = $("leaderboard");
+  if (!container) return;
+
+  const players = (room.players || [])
+    .slice()
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+
+  container.innerHTML = players.map((player, index) => `
+    <div class="player">
+      <span>
+        ${index + 1}. ${escapeHTML(player.name)}
+        ${player.isCurrentTurn ? " — Playing now" : ""}
+      </span>
+      <b class="score">${Number(player.score || 0)} pts</b>
+    </div>
+  `).join("") || "<p>No scores yet.</p>";
+}
+
+/* -------------------------------------------------
+   SESSION TIMER
 -------------------------------------------------- */
 
 function startSessionClock() {
   clearInterval(sessionTimer);
+  sessionTimer = null;
 
   if (!room?.startedAt || !room?.duration) return;
 
-  sessionTimer = setInterval(() => {
-    const elapsed = Math.floor(
-      (Date.now() - Number(room.startedAt)) / 1000
-    );
-
-    const remaining = Math.max(
-      0,
-      Number(room.duration) * 60 - elapsed
-    );
+  const update = () => {
+    const startedAt = Number(room.startedAt);
+    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+    const remaining = Math.max(0, Number(room.duration) * 60 - elapsed);
 
     const minutes = Math.floor(remaining / 60);
     const secondsLeft = remaining % 60;
+    const display = `${minutes}:${String(secondsLeft).padStart(2, "0")}`;
 
-    const display =
-      `${minutes}:${String(secondsLeft).padStart(2, "0")}`;
+    if ($("sessionClock")) $("sessionClock").textContent = display;
+  };
 
-    if ($("sessionClock")) {
-      $("sessionClock").textContent = display;
-    }
-
-    if (remaining <= 0) {
-      clearInterval(sessionTimer);
-    }
-  }, 1000);
+  update();
+  sessionTimer = setInterval(update, 1000);
 }
 
 /* -------------------------------------------------
-   LIVE ROOM UPDATES
+   CAMERA PREVIEW
+-------------------------------------------------- */
+
+async function startCameraPreview() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    if ($("cameraStatus")) {
+      $("cameraStatus").textContent =
+        "Camera preview is not supported by this browser.";
+    }
+    return;
+  }
+
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: false
+    });
+
+    const preview = $("cameraPreview");
+
+    if (preview) {
+      preview.srcObject = cameraStream;
+      preview.muted = true;
+      await preview.play().catch(() => {});
+    }
+
+    if ($("cameraStatus")) {
+      $("cameraStatus").textContent =
+        "Camera preview is active. This version does not record or upload video.";
+    }
+  } catch (error) {
+    if ($("cameraStatus")) {
+      $("cameraStatus").textContent =
+        "Camera access was not granted or is unavailable.";
+    }
+  }
+}
+
+/* -------------------------------------------------
+   LIVE SERVER UPDATES
 -------------------------------------------------- */
 
 socket.on("room:update", updatedRoom => {
   if (!room || updatedRoom.id !== room.id) return;
 
-  const previousQuestion = activeIndex;
-
   room = updatedRoom;
 
-  if (role === "player" && previousQuestion !== null) {
-    const question = room.questions[previousQuestion];
+  if (role === "player" && activeIndex !== null) {
+    const question = room.questions?.[activeIndex];
 
-    if (!question || questionIsAnswered(question)) {
+    if (!question || isAnswered(question)) {
       activeIndex = null;
+      chosen = null;
       locked = false;
-      clearInterval(timer);
+      clearInterval(answerTimer);
 
-      $("questionArea").innerHTML =
-        "<p>This question has been submitted and is now locked.</p>";
+      if ($("questionArea")) {
+        $("questionArea").innerHTML =
+          "<p>This question has been submitted and is now unavailable.</p>";
+      }
     }
   }
 
   renderRoom(room);
 });
 
+socket.on("host:update", updatedRoom => {
+  if (!room || updatedRoom.id !== room.id || role !== "host") return;
+
+  room = updatedRoom;
+  renderRoom(room);
+});
+
 /* -------------------------------------------------
-   CONNECTION STATUS
+   CONNECTION AND RECONNECTION
 -------------------------------------------------- */
 
 socket.on("connect", () => {
-  $("headerStatus").textContent =
-    room ? "Reconnecting..." : "Connected";
+  updateHeader();
+
+  if (room) {
+    if (role === "host") {
+      attemptHostResume();
+    }
+    return;
+  }
+
+  attemptHostResume();
 });
 
 socket.on("disconnect", () => {
-  $("headerStatus").textContent = "Connection lost — reconnecting...";
-  say("Your connection was interrupted. Your session may still be active.");
+  if ($("headerStatus")) {
+    $("headerStatus").textContent = "Connection lost — reconnecting...";
+  }
+
+  say("Your connection was interrupted. The room may still be active.");
 });
 
 socket.on("connect_error", () => {
-  say("Unable to connect to the game server. Please check your connection.");
+  say("Unable to connect to the game server. Check your internet connection.");
 });
 
 /* -------------------------------------------------
    INITIAL DISPLAY
 -------------------------------------------------- */
 
-updateQuestionDistribution();
+if ($("generationStatus")) {
+  $("generationStatus").textContent =
+    "AI question generation is not connected yet.";
+}
+
+if ($("bankCount")) {
+  $("bankCount").textContent = `${bank.length} questions in your bank.`;
+}
+
+updateHeader();
