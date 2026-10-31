@@ -1,3 +1,4 @@
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -74,7 +75,8 @@ function cleanQuestion(question, index) {
     options,
     correct,
     answered: false,
-    claimedBy: null
+    claimedBy: null,
+    buzzerActive: false
   };
 }
 
@@ -85,11 +87,14 @@ function publicQuestion(q) {
     options: [...q.options],
     answered: q.answered,
     claimedBy: q.claimedBy,
+    buzzerActive: Boolean(q.buzzerActive),
     status: q.answered
       ? "answered"
-      : q.claimedBy
-        ? "claimed"
-        : "available"
+      : q.buzzerActive
+        ? "buzzer"
+        : q.claimedBy
+          ? "claimed"
+          : "available"
   };
 }
 
@@ -117,8 +122,30 @@ function publicView(room) {
         : "Waiting for approval",
       answeredCount: p.answeredQuestions.length,
       answeredQuestions: [...p.answeredQuestions],
-      isCurrentTurn: room.currentTurnPlayerId === p.id
+      isCurrentTurn: room.currentTurnPlayerId === p.id,
+
+      // These fields tell the frontend who can see and claim the bell.
+      canBuzz: Boolean(
+        room.buzzer &&
+        room.buzzer.active &&
+        room.buzzer.eligiblePlayerIds.includes(p.id) &&
+        !room.buzzer.claimantPlayerId
+      ),
+      isBuzzerPlayer: Boolean(
+        room.buzzer &&
+        room.buzzer.claimantPlayerId === p.id
+      )
     })),
+
+    buzzer: room.buzzer
+      ? {
+          active: room.buzzer.active,
+          questionId: room.buzzer.questionId,
+          originalPlayerId: room.buzzer.originalPlayerId,
+          claimantPlayerId: room.buzzer.claimantPlayerId,
+          deadline: room.buzzer.deadline
+        }
+      : null,
 
     currentTurnPlayerId: room.currentTurnPlayerId,
     turnNumber: room.turnNumber,
@@ -146,6 +173,16 @@ function refereeView(room) {
       currentAnswer: p.answer,
       currentFeedback: p.feedback,
       isCurrentTurn: room.currentTurnPlayerId === p.id,
+      canBuzz: Boolean(
+        room.buzzer &&
+        room.buzzer.active &&
+        room.buzzer.eligiblePlayerIds.includes(p.id) &&
+        !room.buzzer.claimantPlayerId
+      ),
+      isBuzzerPlayer: Boolean(
+        room.buzzer &&
+        room.buzzer.claimantPlayerId === p.id
+      ),
 
       history: room.submissions
         .filter(s => s.playerId === p.id)
@@ -172,7 +209,9 @@ function allPlayersApproved(room) {
 }
 
 function availableQuestions(room) {
-  return room.questions.filter(q => !q.answered && !q.claimedBy);
+  return room.questions.filter(q =>
+    !q.answered && !q.claimedBy && !q.buzzerActive
+  );
 }
 
 function finishRoom(room) {
@@ -180,6 +219,12 @@ function finishRoom(room) {
   room.deadline = null;
   room.sessionDeadline = null;
   room.currentTurnPlayerId = null;
+  room.buzzer = null;
+
+  room.questions.forEach(q => {
+    q.buzzerActive = false;
+  });
+
   emit(room);
 }
 
@@ -221,6 +266,8 @@ function checkAutomaticStart(room) {
 }
 
 function advanceTurn(room, previousPlayerId) {
+  room.buzzer = null;
+
   const players = room.players.filter(p => p.approved);
 
   if (!players.length || !availableQuestions(room).length) {
@@ -244,6 +291,140 @@ function advanceTurn(room, previousPlayerId) {
   }
 
   finishRoom(room);
+}
+
+// Start the buzzer round after a player's selection time expires.
+function startBuzzer(room, timedOutPlayer) {
+  const question = room.questions.find(
+    q => q.id === timedOutPlayer.currentQuestion
+  );
+
+  if (!question || question.answered) {
+    timedOutPlayer.currentQuestion = null;
+    timedOutPlayer.answer = null;
+    timedOutPlayer.pickDeadline = null;
+    advanceTurn(room, timedOutPlayer.id);
+    return;
+  }
+
+  // Release the question from the player who timed out.
+  question.claimedBy = null;
+  question.buzzerActive = true;
+
+  timedOutPlayer.currentQuestion = null;
+  timedOutPlayer.answer = null;
+  timedOutPlayer.feedback = null;
+  timedOutPlayer.pickDeadline = null;
+  timedOutPlayer.status = "Selection time expired";
+
+  room.current = null;
+  room.deadline = null;
+
+  // Only approved players other than the player who timed out can buzz.
+  const eligiblePlayerIds = room.players
+    .filter(p =>
+      p.approved &&
+      p.connected &&
+      p.id !== timedOutPlayer.id
+    )
+    .map(p => p.id);
+
+  if (!eligiblePlayerIds.length) {
+    question.buzzerActive = false;
+    advanceTurn(room, timedOutPlayer.id);
+    return;
+  }
+
+  room.buzzer = {
+    active: true,
+    questionId: question.id,
+    originalPlayerId: timedOutPlayer.id,
+    eligiblePlayerIds,
+    claimantPlayerId: null,
+    deadline: null
+  };
+
+  emit(room);
+}
+
+// Record the buzzer answer and award the bonus mark if correct.
+function resolveBuzzer(room, player, answer) {
+  const buzzer = room.buzzer;
+
+  if (!buzzer || !buzzer.active ||
+      buzzer.claimantPlayerId !== player.id) {
+    return { ok: false, error: "You do not hold this buzzer question." };
+  }
+
+  if (buzzer.deadline && Date.now() > buzzer.deadline) {
+    return { ok: false, error: "Your buzzer answer time has expired." };
+  }
+
+  const question = room.questions.find(
+    q => q.id === buzzer.questionId
+  );
+
+  if (!question || question.answered) {
+    return { ok: false, error: "This question is no longer available." };
+  }
+
+  const selectedAnswer = clean(answer, 1).toUpperCase();
+
+  if (!["A", "B", "C", "D"].includes(selectedAnswer)) {
+    return { ok: false, error: "Choose A, B, C or D." };
+  }
+
+  const isCorrect = selectedAnswer === question.correct;
+
+  // The question closes whether the buzzer answer is right or wrong.
+  question.answered = true;
+  question.buzzerActive = false;
+  question.claimedBy = player.id;
+
+  // A correct buzzer answer earns one bonus mark.
+  const bonusMarks = isCorrect ? 1 : 0;
+  player.score += bonusMarks;
+
+  const submission = {
+    id: makeId(),
+    playerId: player.id,
+    name: player.name,
+    questionId: question.id,
+    questionIndex: room.questions.indexOf(question),
+    question: question.text,
+    options: [...question.options],
+    answer: selectedAnswer,
+    feedback: "",
+    correct: question.correct,
+    isCorrect,
+    marks: bonusMarks,
+    bonusMarks,
+    buzzer: true,
+    submittedAt: Date.now()
+  };
+
+  room.submissions.push(submission);
+  player.answeredQuestions.push(question.id);
+  player.status = isCorrect
+    ? "Correct buzzer answer — 1 bonus mark"
+    : "Incorrect buzzer answer — question closed";
+
+  const originalPlayerId = buzzer.originalPlayerId;
+
+  room.buzzer = null;
+  room.current = null;
+  room.deadline = null;
+
+  // Continue the normal turn order after the buzzer question is resolved.
+  advanceTurn(room, originalPlayerId);
+
+  return {
+    ok: true,
+    correct: isCorrect,
+    bonusMarks,
+    questionClosed: true,
+    submissionId: submission.id
+  };
 }
 
 io.on("connection", socket => {
@@ -312,6 +493,7 @@ io.on("connection", socket => {
       current: null,
       currentTurnPlayerId: null,
       turnNumber: 0,
+      buzzer: null,
 
       status: "lobby",
       startedAt: null,
@@ -430,6 +612,7 @@ io.on("connection", socket => {
         currentQuestion: null,
         answer: null,
         feedback: null,
+        pickDeadline: null,
 
         answeredQuestions: [],
         status: "Waiting for approval"
@@ -522,6 +705,28 @@ io.on("connection", socket => {
       }
     }
 
+    // Remove a kicked player from any active buzzer eligibility list.
+    if (room.buzzer) {
+      room.buzzer.eligiblePlayerIds =
+        room.buzzer.eligiblePlayerIds.filter(id => id !== player.id);
+
+      if (room.buzzer.claimantPlayerId === player.id) {
+        const question = room.questions.find(
+          q => q.id === room.buzzer.questionId
+        );
+
+        if (question) {
+          question.answered = true;
+          question.buzzerActive = false;
+          question.claimedBy = player.id;
+        }
+
+        const originalPlayerId = room.buzzer.originalPlayerId;
+        room.buzzer = null;
+        advanceTurn(room, originalPlayerId);
+      }
+    }
+
     const playerSocket = io.sockets.sockets.get(player.socketId);
 
     if (playerSocket) {
@@ -595,8 +800,6 @@ io.on("connection", socket => {
   });
 
   // REFEREE EDITS ONE QUESTION
-
-  // REFEREE EDITS ONE QUESTION
   socket.on("host:question:edit", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -629,8 +832,6 @@ io.on("connection", socket => {
   });
 
   // REFEREE REMOVES ONE QUESTION
- 
-  // REFEREE REMOVES ONE QUESTION
   socket.on("host:question:delete", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -654,7 +855,6 @@ io.on("connection", socket => {
     emit(room);
     reply(callback, { ok: true });
   });
-
 
   // START SESSION
   socket.on("host:start", (data = {}, callback) => {
@@ -685,6 +885,13 @@ io.on("connection", socket => {
       return reply(callback, { ok: false, error: "The session is not active." });
     }
 
+    if (room.buzzer) {
+      return reply(callback, {
+        ok: false,
+        error: "A buzzer question is currently in progress."
+      });
+    }
+
     if (room.currentTurnPlayerId !== player.id) {
       return reply(callback, {
         ok: false,
@@ -707,10 +914,10 @@ io.on("connection", socket => {
 
     const question = room.questions[index];
 
-    if (question.answered) {
+    if (question.answered || question.buzzerActive) {
       return reply(callback, {
         ok: false,
-        error: "This question has already been answered."
+        error: "This question is no longer available."
       });
     }
 
@@ -748,7 +955,7 @@ io.on("connection", socket => {
       return reply(callback, { ok: false, error: "Active player not found." });
     }
 
-    if (room.currentTurnPlayerId !== player.id) {
+    if (room.buzzer || room.currentTurnPlayerId !== player.id) {
       return reply(callback, { ok: false, error: "It is not your turn." });
     }
 
@@ -782,7 +989,7 @@ io.on("connection", socket => {
       return reply(callback, { ok: false, error: "Active player not found." });
     }
 
-    if (room.currentTurnPlayerId !== player.id) {
+    if (room.buzzer || room.currentTurnPlayerId !== player.id) {
       return reply(callback, { ok: false, error: "It is not your turn." });
     }
 
@@ -843,8 +1050,79 @@ io.on("connection", socket => {
       feedbackSaved: Boolean(feedback)
     });
 
-    // Move to the next player in joining order.
     advanceTurn(room, player.id);
+  });
+
+  // FIRST ELIGIBLE PLAYER TO CLICK THE GREEN BUZZER WINS THE CLAIM
+  socket.on("player:buzzer:claim", (data = {}, callback) => {
+    const room = findRoom(data.roomId);
+    const player = findPlayer(room, socket);
+
+    if (!room || !player || room.status !== "playing") {
+      return reply(callback, { ok: false, error: "Active player not found." });
+    }
+
+    const buzzer = room.buzzer;
+
+    if (!buzzer || !buzzer.active || buzzer.claimantPlayerId) {
+      return reply(callback, {
+        ok: false,
+        error: "The buzzer is no longer available."
+      });
+    }
+
+    if (
+      !player.approved ||
+      !player.connected ||
+      !buzzer.eligiblePlayerIds.includes(player.id)
+    ) {
+      return reply(callback, {
+        ok: false,
+        error: "You are not eligible to claim this buzzer."
+      });
+    }
+
+    const question = room.questions.find(
+      q => q.id === buzzer.questionId
+    );
+
+    if (!question || question.answered || !question.buzzerActive) {
+      return reply(callback, {
+        ok: false,
+        error: "This buzzer question is no longer available."
+      });
+    }
+
+    // This assignment happens synchronously on the server.
+    // Only the first valid click can become the claimant.
+    buzzer.claimantPlayerId = player.id;
+    buzzer.deadline = Date.now() + room.pickTime * 1000;
+
+    question.buzzerActive = false;
+    question.claimedBy = player.id;
+
+    player.status = "Answering a buzzer question";
+
+    reply(callback, {
+      ok: true,
+      question: publicQuestion(question),
+      deadline: buzzer.deadline
+    });
+
+    emit(room);
+  });
+
+  // BUZZER PLAYER SUBMITS AN ANSWER
+  socket.on("player:buzzer:submit", (data = {}, callback) => {
+    const room = findRoom(data.roomId);
+    const player = findPlayer(room, socket);
+
+    if (!room || !player || room.status !== "playing") {
+      return reply(callback, { ok: false, error: "Active player not found." });
+    }
+
+    const result = resolveBuzzer(room, player, data.answer);
+    reply(callback, result);
   });
 
   // REFEREE OVERRIDES THE CORRECT ANSWER FOR A SUBMISSION
@@ -968,23 +1246,81 @@ io.on("connection", socket => {
         player.connected = false;
         player.socketId = null;
         player.status = "Disconnected";
+
+        // A disconnected player cannot claim a buzzer.
+        if (room.buzzer && room.buzzer.active) {
+          room.buzzer.eligiblePlayerIds =
+            room.buzzer.eligiblePlayerIds.filter(id => id !== player.id);
+
+          // If the player had already claimed it, leave the claim in place.
+          // The buzzer answer timer will resolve the unanswered attempt.
+        }
+
         emit(room);
       }
     }
   });
 });
 
-// SESSION TIMER
+// SESSION AND ANSWER TIMERS
 setInterval(() => {
   const now = Date.now();
 
   for (const room of rooms.values()) {
-    if (
-      room.status === "playing" &&
-      room.sessionDeadline &&
-      now >= room.sessionDeadline
-    ) {
+    if (room.status !== "playing") continue;
+
+    // End the session when its overall time expires.
+    if (room.sessionDeadline && now >= room.sessionDeadline) {
       finishRoom(room);
+      continue;
+    }
+
+    // If a buzzer claimant does not answer in time, close the question.
+    if (
+      room.buzzer &&
+      room.buzzer.claimantPlayerId &&
+      room.buzzer.deadline &&
+      now >= room.buzzer.deadline
+    ) {
+      const buzzer = room.buzzer;
+      const question = room.questions.find(
+        q => q.id === buzzer.questionId
+      );
+
+      if (question) {
+        question.answered = true;
+        question.buzzerActive = false;
+      }
+
+      const claimant = room.players.find(
+        p => p.id === buzzer.claimantPlayerId
+      );
+
+      if (claimant) {
+        claimant.status = "Buzzer time expired — question closed";
+      }
+
+      const originalPlayerId = buzzer.originalPlayerId;
+      room.buzzer = null;
+
+      advanceTurn(room, originalPlayerId);
+      continue;
+    }
+
+    // Handle a player's normal answer-selection time expiring.
+    const player = room.players.find(
+      p => p.id === room.currentTurnPlayerId
+    );
+
+    if (
+      !room.buzzer &&
+      player &&
+      player.currentQuestion &&
+      !player.answer &&
+      player.pickDeadline &&
+      now >= player.pickDeadline
+    ) {
+      startBuzzer(room, player);
     }
   }
 }, 1000);
