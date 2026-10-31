@@ -18,6 +18,10 @@ let hostToken = "";
 let playerToken = "";
 let playerName = "";
 let cameraStream = null;
+let buzzerQuestion = null;
+let buzzerAnswer = null;
+let buzzerLocked = false;
+let buzzerSubmitting = false;
 
 const screens = [
   "home", "auth", "setup", "join",
@@ -80,6 +84,18 @@ function stopCamera() {
   }
 }
 
+function resetQuestionState() {
+  clearInterval(answerTimer);
+  answerTimer = null;
+  activeIndex = null;
+  chosen = null;
+  locked = false;
+  buzzerQuestion = null;
+  buzzerAnswer = null;
+  buzzerLocked = false;
+  buzzerSubmitting = false;
+}
+
 function getPlayer() {
   return room?.players?.find(player => player.id === playerId);
 }
@@ -111,13 +127,16 @@ function canPickQuestion(question) {
   return Boolean(
     role === "player" &&
     room?.status === "playing" &&
+    !room?.buzzer?.active &&
     player &&
     isApproved(player) &&
     player.isCurrentTurn &&
     activeIndex === null &&
+    !buzzerQuestion &&
     question &&
     !isAnswered(question) &&
-    !isClaimed(question)
+    !isClaimed(question) &&
+    !question.buzzerActive
   );
 }
 
@@ -186,13 +205,11 @@ $("playerStart")?.addEventListener("click", () => {
 function goHome() {
   stopTimers();
   stopCamera();
+  resetQuestionState();
 
   room = null;
   role = "";
   playerId = "";
-  activeIndex = null;
-  chosen = null;
-  locked = false;
 
   say("");
   updateHeader();
@@ -204,7 +221,6 @@ $("backHome2")?.addEventListener("click", goHome);
 $("homeBtn")?.addEventListener("click", goHome);
 
 $("authBtn")?.addEventListener("click", () => {
-  // This is only a demonstration gate, not secure authentication.
   if ($("password")?.value !== "1144") {
     say("Incorrect demo password.");
     return;
@@ -588,6 +604,7 @@ window.deleteRoomQuestion = index => {
 function finishRoom(updatedRoom) {
   stopTimers();
   stopCamera();
+  resetQuestionState();
 
   show("finished");
 
@@ -688,6 +705,28 @@ function renderRefereeDashboard() {
   renderPlayerProfiles();
   renderMarkingPanel();
   startSessionClock();
+
+  if (room.buzzer?.active) {
+    const question = room.questions.find(
+      q => q.id === room.buzzer.questionId
+    );
+
+    if ($("monitor") && question) {
+      $("monitor").insertAdjacentHTML("afterbegin", `
+        <div class="entry">
+          <b>BUZZER ROUND ACTIVE</b>
+          <p>${escapeHTML(question.text)}</p>
+          <p>
+            ${
+              room.buzzer.claimantPlayerId
+                ? "A player has claimed the buzzer."
+                : "Waiting for the first eligible player to click the bell."
+            }
+          </p>
+        </div>
+      `);
+    }
+  }
 }
 
 /* -------------------------------------------------
@@ -725,6 +764,8 @@ function renderPlayerProfiles() {
             <p>Answer: ${escapeHTML(item.answer || "Not submitted")}</p>
             <p>Explanation: ${escapeHTML(item.feedback || "None")}</p>
             <p>Marks: ${Number(item.marks || 0)}</p>
+            ${item.buzzer ? "<p><b>Buzzer answer</b></p>" : ""}
+            ${item.bonusMarks ? `<p>Bonus marks: ${Number(item.bonusMarks)}</p>` : ""}
           </div>
         `).join("") || "<p>No activity recorded yet.</p>"}
 
@@ -751,12 +792,17 @@ function renderMarkingPanel() {
       <b>
         ${escapeHTML(submission.name)}
         · Question ${Number(submission.questionIndex) + 1}
+        ${submission.buzzer ? " · BUZZER" : ""}
       </b>
 
       <p>${escapeHTML(submission.question)}</p>
       <p>Answer selected: ${escapeHTML(submission.answer || "Not provided")}</p>
       <p>Explanation: ${escapeHTML(submission.feedback || "None")}</p>
       <p>Current result: ${submission.isCorrect ? "Correct" : "Incorrect"}</p>
+
+      ${submission.buzzer ? `
+        <p>Bonus marks recorded: ${Number(submission.bonusMarks || 0)}</p>
+      ` : ""}
 
       <label>
         Marks
@@ -849,6 +895,15 @@ function renderPlayerDashboard() {
   if (!isApproved(player)) {
     $("phase").textContent =
       "Your request has been sent. Please wait for referee approval.";
+  } else if (room.buzzer?.active && player.isBuzzerPlayer) {
+    $("phase").textContent =
+      "You won the buzzer! Answer the question now.";
+  } else if (room.buzzer?.active && player.canBuzz) {
+    $("phase").textContent =
+      "A player ran out of time! Click the green bell to answer.";
+  } else if (room.buzzer?.active) {
+    $("phase").textContent =
+      "A buzzer round is in progress. Please wait.";
   } else if (room.status === "lobby") {
     $("phase").textContent =
       "You have been approved. Waiting for the referee to start.";
@@ -873,13 +928,20 @@ function renderPlayerDashboard() {
   }
 
   if ($("turnIndicator")) {
-    $("turnIndicator").textContent = player.isCurrentTurn
-      ? "YOUR TURN"
-      : "WAITING FOR YOUR TURN";
+    $("turnIndicator").textContent =
+      room.buzzer?.active && player.canBuzz
+        ? "BUZZER AVAILABLE"
+        : room.buzzer?.active && player.isBuzzerPlayer
+          ? "YOU WON THE BUZZER"
+          : player.isCurrentTurn
+            ? "YOUR TURN"
+            : "WAITING FOR YOUR TURN";
   }
 
   renderQuestionTiles();
   renderLeaderboard();
+  renderBuzzerArea();
+  renderNormalQuestionArea();
   startSessionClock();
 }
 
@@ -905,6 +967,9 @@ function renderQuestionTiles() {
     if (answered) {
       label += " — Answered";
       classes += " answered";
+    } else if (question.buzzerActive) {
+      label += " — Buzzer round";
+      classes += " claimed";
     } else if (claimed && !mine) {
       label += " — Taken";
       classes += " claimed";
@@ -928,7 +993,7 @@ function renderQuestionTiles() {
 }
 
 window.pickQuestion = index => {
-  if (!room || activeIndex !== null) return;
+  if (!room || activeIndex !== null || room.buzzer?.active) return;
 
   const question = room.questions?.[index];
 
@@ -948,8 +1013,6 @@ window.pickQuestion = index => {
       return;
     }
 
-    if (response.room) room = response.room;
-
     activeIndex = index;
     chosen = null;
     locked = false;
@@ -963,8 +1026,41 @@ window.pickQuestion = index => {
 };
 
 /* -------------------------------------------------
-   QUESTION AND ANSWER SCREEN
+   NORMAL QUESTION AREA
 -------------------------------------------------- */
+
+function renderNormalQuestionArea() {
+  if (buzzerQuestion) return;
+
+  const player = getPlayer();
+
+  if (room?.buzzer?.active) {
+    if (player?.isBuzzerPlayer) {
+      return;
+    }
+
+    if (activeIndex !== null) {
+      resetQuestionState();
+    }
+
+    if ($("questionArea")) {
+      $("questionArea").innerHTML =
+        "<p>A buzzer round is active. Your normal question board is paused.</p>";
+    }
+
+    return;
+  }
+
+  if (activeIndex !== null) {
+    drawQuestion();
+    return;
+  }
+
+  if ($("questionArea") && room?.status === "playing") {
+    $("questionArea").innerHTML =
+      "<p>Choose a question when it is your turn. Any explanation you provide is optional.</p>";
+  }
+}
 
 function drawQuestion() {
   const question = room?.questions?.[activeIndex];
@@ -992,7 +1088,7 @@ function drawQuestion() {
         Lock answer
       </button>
 
-      <div id="explain" class="hidden">
+      <div id="explain" class="${locked ? "" : "hidden"}">
         <label>
           Optional explanation
           <textarea id="feedback" rows="3"
@@ -1004,12 +1100,12 @@ function drawQuestion() {
     </div>
   `;
 
-  $("lock").addEventListener("click", lockAnswer);
-  $("submit").addEventListener("click", submitAnswer);
+  $("lock")?.addEventListener("click", lockAnswer);
+  $("submit")?.addEventListener("click", submitAnswer);
 }
 
 /* -------------------------------------------------
-   ANSWER TIMER
+   NORMAL ANSWER TIMER
 -------------------------------------------------- */
 
 function startAnswerClock() {
@@ -1027,7 +1123,7 @@ function startAnswerClock() {
       answerTimer = null;
 
       if (!locked) {
-        say("Your answer-selection time has expired. Select and lock an answer if the session still permits it.");
+        say("Your selection time has expired. The server is handling the buzzer round.");
       } else {
         submitAnswer();
       }
@@ -1036,7 +1132,7 @@ function startAnswerClock() {
 }
 
 /* -------------------------------------------------
-   LOCK ANSWER
+   LOCK NORMAL ANSWER
 -------------------------------------------------- */
 
 function lockAnswer() {
@@ -1067,8 +1163,8 @@ function lockAnswer() {
       input.disabled = true;
     });
 
-    $("lock").disabled = true;
-    $("explain").classList.remove("hidden");
+    if ($("lock")) $("lock").disabled = true;
+    if ($("explain")) $("explain").classList.remove("hidden");
 
     seconds = Number(room.explainTime || 120);
 
@@ -1080,7 +1176,7 @@ function lockAnswer() {
 }
 
 /* -------------------------------------------------
-   SUBMIT ANSWER
+   SUBMIT NORMAL ANSWER
 -------------------------------------------------- */
 
 function submitAnswer() {
@@ -1100,9 +1196,7 @@ function submitAnswer() {
       return;
     }
 
-    activeIndex = null;
-    chosen = null;
-    locked = false;
+    resetQuestionState();
 
     if ($("questionArea")) {
       $("questionArea").innerHTML =
@@ -1110,6 +1204,205 @@ function submitAnswer() {
     }
 
     say("Answer submitted successfully. Please wait for your next turn.");
+  });
+}
+
+/* -------------------------------------------------
+   BUZZER DISPLAY
+-------------------------------------------------- */
+
+function renderBuzzerArea() {
+  const existing = $("buzzerArea");
+
+  if (existing) existing.remove();
+
+  const player = getPlayer();
+  if (!player || role !== "player") return;
+
+  const area = document.createElement("div");
+  area.id = "buzzerArea";
+  area.className = "entry";
+
+  if (
+    room?.buzzer?.active &&
+    player.canBuzz &&
+    !room.buzzer.claimantPlayerId
+  ) {
+    area.innerHTML = `
+      <div style="text-align:center; padding:16px;">
+        <h2>Someone ran out of time!</h2>
+        <p>Be the first to click the bell to claim the question.</p>
+        <button
+          id="greenBuzzer"
+          type="button"
+          style="
+            background:#16a34a;
+            color:white;
+            border:0;
+            border-radius:50%;
+            width:100px;
+            height:100px;
+            font-size:42px;
+            cursor:pointer;
+            box-shadow:0 4px 12px rgba(0,0,0,.2);
+          "
+          aria-label="Claim buzzer question"
+        >🔔</button>
+        <p><b>CLICK TO BUZZ!</b></p>
+      </div>
+    `;
+
+    area.querySelector("#greenBuzzer").addEventListener("click", claimBuzzer);
+  } else if (
+    room?.buzzer?.active &&
+    player.isBuzzerPlayer
+  ) {
+    area.innerHTML = `
+      <div style="text-align:center; padding:12px;">
+        <h2>You won the buzzer!</h2>
+        <p>Answer the question below. A correct answer earns 1 bonus mark.</p>
+      </div>
+    `;
+  } else if (room?.buzzer?.active) {
+    area.innerHTML = `
+      <p style="text-align:center;">
+        The buzzer has been claimed. Please wait for the answer.
+      </p>
+    `;
+  } else {
+    return;
+  }
+
+  const dashboard = $("playerDash");
+  const questionArea = $("questionArea");
+
+  if (dashboard && questionArea) {
+    questionArea.parentNode.insertBefore(area, questionArea);
+  } else if (dashboard) {
+    dashboard.appendChild(area);
+  }
+}
+
+/* -------------------------------------------------
+   CLAIM BUZZER
+-------------------------------------------------- */
+
+function claimBuzzer() {
+  if (!room || !room.buzzer?.active) return;
+
+  const button = $("greenBuzzer");
+  if (button) button.disabled = true;
+
+  socket.emit("player:buzzer:claim", {
+    roomId: room.id
+  }, response => {
+    if (!response?.ok) {
+      say(response?.error || "Another player may have claimed the buzzer first.");
+
+      if (button && room?.buzzer?.active && !room.buzzer.claimantPlayerId) {
+        button.disabled = false;
+      }
+
+      return;
+    }
+
+    buzzerQuestion = response.question;
+    buzzerAnswer = null;
+    buzzerLocked = false;
+    buzzerSubmitting = false;
+
+    say("You claimed the buzzer. Select your answer and submit it.");
+    renderBuzzerQuestion();
+  });
+}
+
+/* -------------------------------------------------
+   BUZZER QUESTION AND ANSWER
+-------------------------------------------------- */
+
+function renderBuzzerQuestion() {
+  if (!buzzerQuestion || !$("questionArea")) return;
+
+  $("questionArea").innerHTML = `
+    <div class="entry">
+      <h2>🔔 BUZZER QUESTION</h2>
+      <h3>${escapeHTML(buzzerQuestion.text)}</h3>
+
+      ${buzzerQuestion.options.map((option, index) => `
+        <label class="choice">
+          <input
+            type="radio"
+            name="buzzerAnswer"
+            value="${"ABCD"[index]}"
+            ${buzzerLocked ? "disabled" : ""}
+          >
+          ${"ABCD"[index]}. ${escapeHTML(option)}
+        </label>
+      `).join("")}
+
+      <button id="buzzerSubmit" ${buzzerLocked ? "disabled" : ""}>
+        Submit buzzer answer
+      </button>
+
+      <p class="hint">
+        Correct answer: 1 bonus mark. Wrong answer: the question closes.
+      </p>
+    </div>
+  `;
+
+  $("buzzerSubmit")?.addEventListener("click", submitBuzzerAnswer);
+}
+
+/* -------------------------------------------------
+   SUBMIT BUZZER ANSWER
+-------------------------------------------------- */
+
+function submitBuzzerAnswer() {
+  if (!room || !buzzerQuestion || buzzerSubmitting || buzzerLocked) return;
+
+  buzzerAnswer = document.querySelector(
+    'input[name="buzzerAnswer"]:checked'
+  )?.value;
+
+  if (!buzzerAnswer) {
+    say("Choose an answer before submitting.");
+    return;
+  }
+
+  buzzerSubmitting = true;
+
+  const button = $("buzzerSubmit");
+  if (button) button.disabled = true;
+
+  socket.emit("player:buzzer:submit", {
+    roomId: room.id,
+    answer: buzzerAnswer
+  }, response => {
+    buzzerSubmitting = false;
+
+    if (!response?.ok) {
+      say(response?.error || "Unable to submit your buzzer answer.");
+
+      if (button) button.disabled = false;
+      return;
+    }
+
+    buzzerLocked = true;
+
+    if (response.correct) {
+      say("Correct! You earned 1 bonus mark. The question is now closed.");
+    } else {
+      say("Incorrect. The question is now closed and nobody else can answer it.");
+    }
+
+    buzzerQuestion = null;
+    buzzerAnswer = null;
+
+    if ($("questionArea")) {
+      $("questionArea").innerHTML = response.correct
+        ? "<p><b>Correct buzzer answer!</b> You earned 1 bonus mark.</p>"
+        : "<p><b>Incorrect buzzer answer.</b> This question is closed.</p>";
+    }
   });
 }
 
@@ -1130,6 +1423,7 @@ function renderLeaderboard() {
       <span>
         ${index + 1}. ${escapeHTML(player.name)}
         ${player.isCurrentTurn ? " — Playing now" : ""}
+        ${player.isBuzzerPlayer ? " — Buzzer player" : ""}
       </span>
       <b class="score">${Number(player.score || 0)} pts</b>
     </div>
@@ -1210,19 +1504,50 @@ socket.on("room:update", updatedRoom => {
 
   room = updatedRoom;
 
-  if (role === "player" && activeIndex !== null) {
-    const question = room.questions?.[activeIndex];
+  if (role === "player") {
+    const player = getPlayer();
 
-    if (!question || isAnswered(question)) {
-      activeIndex = null;
-      chosen = null;
-      locked = false;
-      clearInterval(answerTimer);
+    // Clear a normal question if its selection timer expired.
+    // The server releases it and starts the buzzer round.
+    if (
+      activeIndex !== null &&
+      room.buzzer?.active &&
+      !questionIsMine(
+        room.questions.find(q => q.id === room.buzzer.questionId)
+      )
+    ) {
+      resetQuestionState();
 
       if ($("questionArea")) {
         $("questionArea").innerHTML =
-          "<p>This question has been submitted and is now unavailable.</p>";
+          "<p>Your selection time expired. The other players have a chance to answer this question.</p>";
       }
+    }
+
+    // Clear the old buzzer display once the buzzer round is over.
+    if (!room.buzzer?.active && buzzerQuestion) {
+      buzzerQuestion = null;
+      buzzerAnswer = null;
+      buzzerLocked = false;
+      buzzerSubmitting = false;
+    }
+
+    // Clear a normal question if another update shows it has closed.
+    if (activeIndex !== null) {
+      const question = room.questions?.[activeIndex];
+
+      if (!question || isAnswered(question)) {
+        resetQuestionState();
+
+        if ($("questionArea")) {
+          $("questionArea").innerHTML =
+            "<p>This question has been submitted and is now unavailable.</p>";
+        }
+      }
+    }
+
+    if (!player) {
+      resetQuestionState();
     }
   }
 
@@ -1263,6 +1588,20 @@ socket.on("disconnect", () => {
 
 socket.on("connect_error", () => {
   say("Unable to connect to the game server. Check your internet connection.");
+});
+
+socket.on("session:replaced", () => {
+  say("This session has been opened in another browser connection.");
+});
+
+socket.on("player:removed", () => {
+  stopTimers();
+  resetQuestionState();
+  room = null;
+  role = "";
+  playerId = "";
+  say("The referee has removed you from the room.");
+  show("home");
 });
 
 /* -------------------------------------------------
