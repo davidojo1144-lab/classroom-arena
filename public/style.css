@@ -301,6 +301,64 @@ label select {
   text-align: left;
 }
 
+/* Green buzzer challenge */
+
+#buzzerArea {
+  margin: 14px 0;
+}
+
+#buzzerArea .entry {
+  border: 2px solid var(--success);
+  background: var(--success-bg);
+  text-align: center;
+  padding: 18px;
+}
+
+#buzzerArea h3 {
+  color: var(--success);
+  font-size: 20px;
+  margin: 4px 0 10px;
+}
+
+#buzzerArea p {
+  margin: 8px 0;
+}
+
+#greenBuzzer {
+  display: block;
+  width: min(100%, 300px);
+  min-height: 65px;
+  margin: 16px auto 5px;
+  padding: 16px 28px;
+  background: #16803c;
+  color: #fff;
+  border: 2px solid #11632e;
+  border-radius: 12px;
+  font-size: 21px;
+  font-weight: 800;
+  cursor: pointer;
+  box-shadow: 0 4px 0 #0e5427;
+}
+
+#greenBuzzer:hover:not(:disabled) {
+  background: #11632e;
+  transform: translateY(-2px);
+}
+
+#greenBuzzer:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: 0 2px 0 #0e5427;
+}
+
+#greenBuzzer:disabled {
+  background: #aab8ad;
+  border-color: #8c9d90;
+  color: #fff;
+  box-shadow: none;
+  cursor: not-allowed;
+  opacity: 0.8;
+}
+
 /* Timers and session status */
 
 #sessionClock,
@@ -458,5 +516,11 @@ select:focus-visible {
   #leaderboard .player,
   #leaderboard .entry {
     align-items: flex-start;
+  }
+
+  #greenBuzzer {
+    width: 100%;
+    max-width: none;
+    min-height: 60px;
   }
 }
