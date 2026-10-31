@@ -8,11 +8,13 @@ const server = http.createServer(app);
 const io = new Server(server);
 
 app.use(express.static("public"));
+app.use(express.json({ limit: "2mb" }));
 
 const rooms = new Map();
 
-const makeId = () => crypto.randomBytes(6).toString("hex").toUpperCase();
-const makePlayerId = () => crypto.randomUUID();
+const makeId = () => crypto.randomUUID();
+const makeCode = () => crypto.randomBytes(4).toString("hex").toUpperCase();
+const makeToken = () => crypto.randomBytes(32).toString("hex");
 
 const clean = (value, max = 4000) =>
   String(value ?? "").trim().slice(0, max);
@@ -21,16 +23,15 @@ function reply(callback, result) {
   if (typeof callback === "function") callback(result);
 }
 
-function findRoom(roomId) {
-  return rooms.get(String(roomId || ""));
+function findRoom(id) {
+  return rooms.get(String(id || ""));
 }
 
 function findActiveRoomByCode(code) {
   const normalized = clean(code, 30).toUpperCase();
 
   return [...rooms.values()].find(room =>
-    room.code === normalized &&
-    room.status !== "finished"
+    room.code === normalized && room.status !== "finished"
   );
 }
 
@@ -47,105 +48,139 @@ function findPlayer(room, socket) {
   if (!room || socket.data.role !== "player") return null;
   if (socket.data.roomId !== room.id) return null;
 
-  return room.players.find(player =>
-    player.id === socket.data.playerId
-  ) || null;
+  return room.players.find(p => p.id === socket.data.playerId) || null;
 }
 
-function approved(player) {
-  return player.approved === true;
-}
+function cleanQuestion(question, index) {
+  const text = clean(question?.text, 2000);
 
-function answeredCount(player) {
-  return player.answeredQuestions.length;
-}
+  const options = Array.isArray(question?.options)
+    ? question.options.slice(0, 4).map(x => clean(x, 500))
+    : [];
 
-function questionView(question) {
+  const correct = clean(question?.correct, 1).toUpperCase();
+
+  if (!text || options.length !== 4 || options.some(x => !x)) {
+    throw new Error(`Question ${index + 1} needs text and four options.`);
+  }
+
+  if (!["A", "B", "C", "D"].includes(correct)) {
+    throw new Error(`Question ${index + 1} needs a correct answer from A to D.`);
+  }
+
   return {
-    id: question.id,
-    text: question.text,
-    options: [...question.options],
-    answered: question.answered,
-    claimedBy: question.claimedBy,
-    owner: question.claimedBy,
-    status: question.answered
+    id: question.id || makeId(),
+    text,
+    options,
+    correct,
+    answered: false,
+    claimedBy: null
+  };
+}
+
+function publicQuestion(q) {
+  return {
+    id: q.id,
+    text: q.text,
+    options: [...q.options],
+    answered: q.answered,
+    claimedBy: q.claimedBy,
+    status: q.answered
       ? "answered"
-      : question.claimedBy
+      : q.claimedBy
         ? "claimed"
         : "available"
   };
 }
 
-/*
- * The correct answer is deliberately not included in the
- * public question data sent to players.
- */
-function view(room) {
+function publicView(room) {
   return {
     id: room.id,
     name: room.name,
     code: room.code,
+    status: room.status,
 
     duration: room.duration,
     pickTime: room.pickTime,
     explainTime: room.explainTime,
 
-    playerCount: room.playerCount,
-    totalQuestions: room.totalQuestions,
-    perPlayer: room.perPlayer,
-    autoStart: room.autoStart,
+    questions: room.questions.map(publicQuestion),
 
-    status: room.status,
-
-    questions: room.questions.map(questionView),
-
-    players: room.players.map(player => ({
-      id: player.id,
-      name: player.name,
-      score: player.score,
-
-      status: player.approved
-        ? player.connected ? "approved" : "approved; disconnected"
-        : "waiting for approval",
-
-      approved: player.approved,
-      connected: player.connected,
-      online: player.connected ? "Online" : "Offline",
-      connection: player.connected ? "Online" : "Offline",
-
-      question: player.currentQuestion,
-      answer: player.answer,
-      feedback: player.feedback,
-
-      answered: player.answeredQuestions.length,
-      answeredCount: player.answeredQuestions.length,
-      answeredQuestions: [...player.answeredQuestions]
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      score: p.score,
+      approved: p.approved,
+      connected: p.connected,
+      status: p.approved
+        ? p.connected ? "Online" : "Offline"
+        : "Waiting for approval",
+      answeredCount: p.answeredQuestions.length,
+      answeredQuestions: [...p.answeredQuestions],
+      isCurrentTurn: room.currentTurnPlayerId === p.id
     })),
 
-    submissions: room.submissions.map(submission => ({
-      ...submission
-    })),
-
-    current: room.current,
-    deadline: room.deadline,
+    currentTurnPlayerId: room.currentTurnPlayerId,
+    turnNumber: room.turnNumber,
     startedAt: room.startedAt,
     sessionDeadline: room.sessionDeadline
   };
 }
 
-function emit(room) {
-  io.to(room.id).emit("room:update", view(room));
+function refereeView(room) {
+  return {
+    ...publicView(room),
+
+    playerCount: room.playerCount,
+    autoStart: room.autoStart,
+
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      score: p.score,
+      approved: p.approved,
+      connected: p.connected,
+      status: p.status,
+      answeredQuestions: [...p.answeredQuestions],
+      currentQuestion: p.currentQuestion,
+      currentAnswer: p.answer,
+      currentFeedback: p.feedback,
+      isCurrentTurn: room.currentTurnPlayerId === p.id,
+
+      history: room.submissions
+        .filter(s => s.playerId === p.id)
+        .map(s => ({ ...s }))
+    })),
+
+    submissions: room.submissions.map(s => ({ ...s }))
+  };
 }
 
-/* -------------------------------------------------
-   SESSION START RULES
--------------------------------------------------- */
+function emit(room) {
+  io.to(room.id).emit("room:update", publicView(room));
+
+  if (room.hostSocketId) {
+    io.to(room.hostSocketId).emit("host:update", refereeView(room));
+  }
+}
 
 function allPlayersApproved(room) {
   return (
     room.players.length === room.playerCount &&
-    room.players.every(approved)
+    room.players.every(p => p.approved)
   );
+}
+
+function availableQuestions(room) {
+  return room.questions.filter(q => !q.answered && !q.claimedBy);
+}
+
+function finishRoom(room) {
+  room.status = "finished";
+  room.deadline = null;
+  room.sessionDeadline = null;
+  room.currentTurnPlayerId = null;
+  emit(room);
 }
 
 function startRoom(room) {
@@ -153,26 +188,29 @@ function startRoom(room) {
     return { ok: false, error: "The session has already started." };
   }
 
-  if (room.questions.length !== room.totalQuestions) {
-    return { ok: false, error: "The question bank is incomplete." };
+  if (!room.questions.length) {
+    return { ok: false, error: "Add or generate questions first." };
   }
 
   if (!allPlayersApproved(room)) {
     return {
       ok: false,
-      error: "All expected students must join and be approved first."
+      error: "All expected players must join and be approved first."
     };
   }
 
   room.status = "playing";
   room.startedAt = Date.now();
+  room.turnNumber = 1;
+
+  // The first player to join gets the first turn.
+  room.currentTurnPlayerId = room.players[0].id;
 
   room.sessionDeadline = room.duration > 0
-    ? room.startedAt + room.duration * 60 * 1000
+    ? Date.now() + room.duration * 60000
     : null;
 
   emit(room);
-
   return { ok: true };
 }
 
@@ -182,152 +220,100 @@ function checkAutomaticStart(room) {
   }
 }
 
-/* -------------------------------------------------
-   CONNECTION HANDLING
--------------------------------------------------- */
+function advanceTurn(room, previousPlayerId) {
+  const players = room.players.filter(p => p.approved);
+
+  if (!players.length || !availableQuestions(room).length) {
+    finishRoom(room);
+    return;
+  }
+
+  const previousIndex = players.findIndex(p => p.id === previousPlayerId);
+
+  for (let step = 1; step <= players.length; step++) {
+    const next = players[(previousIndex + step) % players.length];
+
+    if (next && next.approved) {
+      room.currentTurnPlayerId = next.id;
+      room.turnNumber += 1;
+      room.current = null;
+      room.deadline = null;
+      emit(room);
+      return;
+    }
+  }
+
+  finishRoom(room);
+}
 
 io.on("connection", socket => {
 
-  /* -----------------------------------------------
-     CREATE ROOM
-  ------------------------------------------------ */
-
+  // CREATE ROOM
   socket.on("room:create", (data = {}, callback) => {
     const name = clean(data.name, 100) || "Classroom Arena";
     const code = clean(data.code, 30).toUpperCase();
 
     const playerCount = Number(data.playerCount);
-    const totalQuestions = Number(data.totalQuestions);
-
-    const duration = Number(data.duration);
-    const pickTime = Number(data.pickTime);
-    const explainTime = Number(data.explainTime);
-
-    const questions = data.questions;
+    const questionsInput = Array.isArray(data.questions)
+      ? data.questions
+      : [];
 
     if (!code) {
       return reply(callback, {
         ok: false,
-        error: "Set a player access code."
+        error: "Set a referee room/access code."
       });
     }
 
     if (findActiveRoomByCode(code)) {
       return reply(callback, {
         ok: false,
-        error: "That access code is already being used by an active session."
+        error: "That room number is already being used by an active referee session."
       });
     }
 
-    if (
-      !Number.isInteger(playerCount) ||
-      playerCount < 1 ||
-      playerCount > 100
-    ) {
+    if (!Number.isInteger(playerCount) || playerCount < 1 || playerCount > 100) {
       return reply(callback, {
         ok: false,
-        error: "Enter a valid number of students."
+        error: "Enter a valid number of players."
       });
     }
 
-    if (
-      !Number.isInteger(totalQuestions) ||
-      totalQuestions < 1 ||
-      totalQuestions > 1000
-    ) {
-      return reply(callback, {
-        ok: false,
-        error: "Enter a valid total number of questions."
-      });
-    }
+    let questions;
 
-    if (totalQuestions % playerCount !== 0) {
-      return reply(callback, {
-        ok: false,
-        error: "The total number of questions must divide evenly among students."
-      });
-    }
-
-    if (
-      !Array.isArray(questions) ||
-      questions.length !== totalQuestions
-    ) {
-      return reply(callback, {
-        ok: false,
-        error: `The question bank must contain exactly ${totalQuestions} questions.`
-      });
-    }
-
-    const cleanedQuestions = [];
-
-    for (let i = 0; i < questions.length; i++) {
-      const question = questions[i];
-
-      const text = clean(question.text, 2000);
-      const options = Array.isArray(question.options)
-        ? question.options.slice(0, 4).map(option => clean(option, 500))
-        : [];
-
-      const correct = clean(question.correct, 1).toUpperCase();
-
-      if (!text || options.length !== 4 || options.some(option => !option)) {
-        return reply(callback, {
-          ok: false,
-          error: `Question ${i + 1} needs question text and four answer options.`
-        });
-      }
-
-      if (!["A", "B", "C", "D"].includes(correct)) {
-        return reply(callback, {
-          ok: false,
-          error: `Question ${i + 1} needs a correct answer from A to D.`
-        });
-      }
-
-      cleanedQuestions.push({
-        id: i,
-        text,
-        options,
-        correct,
-        answered: false,
-        claimedBy: null
-      });
+    try {
+      questions = questionsInput.map(cleanQuestion);
+    } catch (error) {
+      return reply(callback, { ok: false, error: error.message });
     }
 
     const id = makeId();
+    const hostToken = makeToken();
 
     const room = {
       id,
       name,
       code,
 
+      hostToken,
       hostSocketId: socket.id,
 
       playerCount,
-      totalQuestions,
-      perPlayer: totalQuestions / playerCount,
-
       autoStart: Boolean(data.autoStart),
 
-      duration: Number.isFinite(duration) && duration >= 0
-        ? duration
-        : 120,
+      duration: Math.max(0, Number(data.duration) || 120),
+      pickTime: Math.max(10, Number(data.pickTime) || 60),
+      explainTime: Math.max(0, Number(data.explainTime) || 120),
 
-      pickTime: Number.isFinite(pickTime) && pickTime >= 10
-        ? pickTime
-        : 60,
-
-      explainTime: Number.isFinite(explainTime) && explainTime >= 10
-        ? explainTime
-        : 120,
-
-      questions: cleanedQuestions,
+      questions,
       players: [],
       submissions: [],
 
       current: null,
-      status: "lobby",
+      currentTurnPlayerId: null,
+      turnNumber: 0,
 
+      status: "lobby",
       startedAt: null,
       deadline: null,
       sessionDeadline: null
@@ -341,16 +327,45 @@ io.on("connection", socket => {
 
     reply(callback, {
       ok: true,
-      room: view(room)
+      room: refereeView(room),
+      hostToken
     });
 
     emit(room);
   });
 
-  /* -----------------------------------------------
-     PLAYER JOIN OR RESUME
-  ------------------------------------------------ */
+  // REFEREE RECONNECT
+  socket.on("host:resume", (data = {}, callback) => {
+    const room = findRoom(data.roomId);
 
+    if (!room || !data.hostToken || data.hostToken !== room.hostToken) {
+      return reply(callback, {
+        ok: false,
+        error: "Invalid referee recovery details."
+      });
+    }
+
+    if (room.hostSocketId && room.hostSocketId !== socket.id) {
+      const old = io.sockets.sockets.get(room.hostSocketId);
+      if (old) old.emit("session:replaced");
+    }
+
+    room.hostSocketId = socket.id;
+
+    socket.join(room.id);
+    socket.data.roomId = room.id;
+    socket.data.role = "host";
+
+    reply(callback, {
+      ok: true,
+      room: refereeView(room),
+      hostToken: room.hostToken
+    });
+
+    emit(room);
+  });
+
+  // PLAYER JOIN OR RESUME
   socket.on("room:join", (data = {}, callback) => {
     const code = clean(data.code, 30).toUpperCase();
     const name = clean(data.name, 50);
@@ -358,7 +373,7 @@ io.on("connection", socket => {
     if (!code || !name) {
       return reply(callback, {
         ok: false,
-        error: "Enter your name and the room access code."
+        error: "Enter your name and room number."
       });
     }
 
@@ -371,15 +386,27 @@ io.on("connection", socket => {
       });
     }
 
-    let player = room.players.find(existing =>
-      existing.name.toLowerCase() === name.toLowerCase()
+    let player = room.players.find(p =>
+      p.name.toLowerCase() === name.toLowerCase()
     );
 
-    if (!player) {
+    if (player) {
+      if (!data.resumeToken || data.resumeToken !== player.resumeToken) {
+        return reply(callback, {
+          ok: false,
+          error: "This player name is already registered. Use your recovery details to resume."
+        });
+      }
+
+      if (player.socketId && player.socketId !== socket.id) {
+        const old = io.sockets.sockets.get(player.socketId);
+        if (old) old.emit("session:replaced");
+      }
+    } else {
       if (room.status !== "lobby") {
         return reply(callback, {
           ok: false,
-          error: "This session has already started. Only registered players can resume."
+          error: "The session has started. Only registered players can resume."
         });
       }
 
@@ -391,9 +418,9 @@ io.on("connection", socket => {
       }
 
       player = {
-        id: makePlayerId(),
+        id: makeId(),
+        resumeToken: makeToken(),
         name,
-
         score: 0,
 
         approved: false,
@@ -405,29 +432,10 @@ io.on("connection", socket => {
         feedback: null,
 
         answeredQuestions: [],
-
-        locked: false,
-        pickDeadline: null,
-        explainDeadline: null
+        status: "Waiting for approval"
       };
 
       room.players.push(player);
-    } else {
-      /*
-       * A returning player reconnects to their existing player
-       * record instead of creating a duplicate.
-       */
-      if (
-        player.socketId &&
-        player.socketId !== socket.id
-      ) {
-        const oldSocket = io.sockets.sockets.get(player.socketId);
-
-        if (oldSocket) {
-          oldSocket.leave(room.id);
-          oldSocket.emit("session:replaced");
-        }
-      }
     }
 
     player.socketId = socket.id;
@@ -440,8 +448,9 @@ io.on("connection", socket => {
 
     reply(callback, {
       ok: true,
-      room: view(room),
+      room: publicView(room),
       playerId: player.id,
+      resumeToken: player.resumeToken,
       approved: player.approved
     });
 
@@ -457,37 +466,29 @@ io.on("connection", socket => {
     checkAutomaticStart(room);
   });
 
-  /* -----------------------------------------------
-     REFEREE APPROVAL
-  ------------------------------------------------ */
-
+  // APPROVE PLAYER
   socket.on("host:approve", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
     if (!isHost(room, socket)) {
-      return reply(callback, {
-        ok: false,
-        error: "Referee only."
-      });
+      return reply(callback, { ok: false, error: "Referee only." });
     }
 
     if (room.status !== "lobby") {
       return reply(callback, {
         ok: false,
-        error: "Player approval is closed after the session starts."
+        error: "Approval is closed after the session starts."
       });
     }
 
     const player = room.players.find(p => p.id === data.playerId);
 
     if (!player) {
-      return reply(callback, {
-        ok: false,
-        error: "Player not found."
-      });
+      return reply(callback, { ok: false, error: "Player not found." });
     }
 
     player.approved = true;
+    player.status = "Approved";
 
     reply(callback, { ok: true });
 
@@ -495,116 +496,184 @@ io.on("connection", socket => {
     emit(room);
   });
 
-  /* -----------------------------------------------
-     REFEREE REJECT / KICK PLAYER
-  ------------------------------------------------ */
-
+  // KICK PLAYER
   socket.on("host:kick", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
     if (!isHost(room, socket)) {
-      return reply(callback, {
-        ok: false,
-        error: "Referee only."
-      });
+      return reply(callback, { ok: false, error: "Referee only." });
     }
 
-    const playerIndex = room.players.findIndex(
-      player => player.id === data.playerId
-    );
+    const index = room.players.findIndex(p => p.id === data.playerId);
 
-    if (playerIndex === -1) {
-      return reply(callback, {
-        ok: false,
-        error: "Player not found."
-      });
+    if (index < 0) {
+      return reply(callback, { ok: false, error: "Player not found." });
     }
 
-    const player = room.players[playerIndex];
+    const player = room.players[index];
 
-    if (player.socketId) {
-      const playerSocket = io.sockets.sockets.get(player.socketId);
-
-      if (playerSocket) {
-        playerSocket.emit("player:removed");
-        playerSocket.leave(room.id);
-        playerSocket.data.roomId = null;
-        playerSocket.data.role = null;
-        playerSocket.data.playerId = null;
-      }
-    }
-
-    /*
-     * Release a question if the removed player had claimed one
-     * but had not submitted it.
-     */
-    if (player.currentQuestion !== null) {
-      const question = room.questions[player.currentQuestion];
+    if (player.currentQuestion) {
+      const question = room.questions.find(
+        q => q.id === player.currentQuestion
+      );
 
       if (question && !question.answered) {
         question.claimedBy = null;
       }
     }
 
-    room.players.splice(playerIndex, 1);
+    const playerSocket = io.sockets.sockets.get(player.socketId);
+
+    if (playerSocket) {
+      playerSocket.emit("player:removed");
+      playerSocket.leave(room.id);
+    }
+
+    room.players.splice(index, 1);
+
+    if (room.status === "playing" &&
+        room.currentTurnPlayerId === player.id) {
+      advanceTurn(room, player.id);
+    } else {
+      emit(room);
+    }
 
     reply(callback, { ok: true });
-
-    emit(room);
   });
 
-  /* -----------------------------------------------
-     MANUAL SESSION START
-  ------------------------------------------------ */
+  // EDIT OR REPLACE QUESTION BANK BEFORE START
+  socket.on("host:questions:update", (data = {}, callback) => {
+    const room = findRoom(data.roomId);
 
+    if (!isHost(room, socket)) {
+      return reply(callback, { ok: false, error: "Referee only." });
+    }
+
+    if (room.status !== "lobby") {
+      return reply(callback, {
+        ok: false,
+        error: "The question bank can only be edited before the session starts."
+      });
+    }
+
+    if (!Array.isArray(data.questions)) {
+      return reply(callback, {
+        ok: false,
+        error: "Send a valid question list."
+      });
+    }
+
+    try {
+      room.questions = data.questions.map(cleanQuestion);
+    } catch (error) {
+      return reply(callback, { ok: false, error: error.message });
+    }
+
+    emit(room);
+    reply(callback, { ok: true, totalQuestions: room.questions.length });
+  });
+
+  // REFEREE ADDS A QUESTION
+  socket.on("host:question:add", (data = {}, callback) => {
+    const room = findRoom(data.roomId);
+
+    if (!isHost(room, socket) || room.status !== "lobby") {
+      return reply(callback, {
+        ok: false,
+        error: "Only the referee can add questions before the session starts."
+      });
+    }
+
+    try {
+      room.questions.push(cleanQuestion(data.question, room.questions.length));
+    } catch (error) {
+      return reply(callback, { ok: false, error: error.message });
+    }
+
+    emit(room);
+    reply(callback, { ok: true });
+  });
+
+  // REFEREE EDITS ONE QUESTION
+  socket.on("host:question:edit", (data = {}, callback) => {
+    const room = findRoom(data.roomId);
+
+    if (!isHost(room, socket) || room.status !== "lobby") {
+      return reply(callback, {
+        ok: false,
+        error: "Questions can only be edited before the session starts."
+      });
+    }
+
+    const index = room.questions.findIndex(q => q.id === data.questionId);
+
+    if (index < 0) {
+      return reply(callback, { ok: false, error: "Question not found." });
+    }
+
+    try {
+      room.questions[index] = cleanQuestion({
+        ...data.question,
+        id: room.questions[index].id
+      }, index);
+    } catch (error) {
+      return reply(callback, { ok: false, error: error.message });
+    }
+
+    emit(room);
+    reply(callback, { ok: true });
+  });
+
+  // REFEREE REMOVES ONE QUESTION
+  socket.on("host:question:delete", (data = {}, callback) => {
+    const room = findRoom(data.roomId);
+
+    if (!isHost(room, socket) || room.status !== "lobby") {
+      return reply(callback, {
+        ok: false,
+        error: "Questions can only be removed before the session starts."
+      });
+    }
+
+    room.questions = room.questions.filter(q => q.id !== data.questionId);
+
+    emit(room);
+    reply(callback, { ok: true });
+  });
+
+  // START SESSION
   socket.on("host:start", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
     if (!isHost(room, socket)) {
-      return reply(callback, {
-        ok: false,
-        error: "Referee only."
-      });
+      return reply(callback, { ok: false, error: "Referee only." });
     }
 
     const result = startRoom(room);
-
     reply(callback, result);
   });
 
-  /* -----------------------------------------------
-     PLAYER CLAIMS A QUESTION
-  ------------------------------------------------ */
-
+  // PLAYER CLAIMS A QUESTION ON THEIR TURN
   socket.on("player:pick", (data = {}, callback) => {
     const room = findRoom(data.roomId);
     const player = findPlayer(room, socket);
 
     if (!room || !player) {
-      return reply(callback, {
-        ok: false,
-        error: "Player or room not found."
-      });
+      return reply(callback, { ok: false, error: "Player or room not found." });
     }
 
-    if (!approved(player)) {
-      return reply(callback, {
-        ok: false,
-        error: "Wait for referee approval."
-      });
+    if (!player.approved) {
+      return reply(callback, { ok: false, error: "Wait for referee approval." });
     }
 
     if (room.status !== "playing") {
-      return reply(callback, {
-        ok: false,
-        error: "The session is not active."
-      });
+      return reply(callback, { ok: false, error: "The session is not active." });
     }
 
-    if (room.sessionDeadline && Date.now() >= room.sessionDeadline) {
+    if (room.currentTurnPlayerId !== player.id) {
       return reply(callback, {
         ok: false,
-        error: "The session time has expired."
+        error: "It is not your turn yet. Please wait."
       });
     }
 
@@ -615,32 +684,14 @@ io.on("connection", socket => {
       });
     }
 
-    if (answeredCount(player) >= room.perPlayer) {
-      return reply(callback, {
-        ok: false,
-        error: "You have reached your maximum number of questions."
-      });
-    }
-
     const index = Number(data.index);
 
-    if (
-      !Number.isInteger(index) ||
-      index < 0 ||
-      index >= room.questions.length
-    ) {
-      return reply(callback, {
-        ok: false,
-        error: "Invalid question."
-      });
+    if (!Number.isInteger(index) || index < 0 || index >= room.questions.length) {
+      return reply(callback, { ok: false, error: "Invalid question number." });
     }
 
     const question = room.questions[index];
 
-    /*
-     * This is the global lock.
-     * A question can only be claimed by one player at a time.
-     */
     if (question.answered) {
       return reply(callback, {
         ok: false,
@@ -648,7 +699,7 @@ io.on("connection", socket => {
       });
     }
 
-    if (question.claimedBy && question.claimedBy !== player.id) {
+    if (question.claimedBy) {
       return reply(callback, {
         ok: false,
         error: "Another player has already claimed this question."
@@ -656,134 +707,82 @@ io.on("connection", socket => {
     }
 
     question.claimedBy = player.id;
-
-    player.currentQuestion = index;
+    player.currentQuestion = question.id;
     player.answer = null;
     player.feedback = null;
-    player.locked = false;
-
     player.pickDeadline = Date.now() + room.pickTime * 1000;
-    player.explainDeadline = null;
+    player.status = "Choosing an answer";
 
-    player.status = "Selecting answer";
-
-    room.current = index;
+    room.current = question.id;
     room.deadline = player.pickDeadline;
 
     reply(callback, {
       ok: true,
-      questionIndex: index
+      question: publicQuestion(question)
     });
 
     emit(room);
   });
 
-  /* -----------------------------------------------
-     PLAYER LOCKS THEIR ANSWER
-  ------------------------------------------------ */
-
+  // PLAYER LOCKS SELECTED OPTION
   socket.on("player:lock", (data = {}, callback) => {
     const room = findRoom(data.roomId);
     const player = findPlayer(room, socket);
 
     if (!room || !player || room.status !== "playing") {
-      return reply(callback, {
-        ok: false,
-        error: "Player or active session not found."
-      });
+      return reply(callback, { ok: false, error: "Active player not found." });
     }
 
-    if (player.currentQuestion === null || player.locked) {
-      return reply(callback, {
-        ok: false,
-        error: "There is no unlocked question to submit."
-      });
+    if (room.currentTurnPlayerId !== player.id) {
+      return reply(callback, { ok: false, error: "It is not your turn." });
     }
 
-    if (
-      player.pickDeadline &&
-      Date.now() > player.pickDeadline
-    ) {
-      return reply(callback, {
-        ok: false,
-        error: "Your answer selection time has expired."
-      });
+    if (!player.currentQuestion || player.answer) {
+      return reply(callback, { ok: false, error: "No answer is waiting to be locked." });
+    }
+
+    if (Date.now() > player.pickDeadline) {
+      return reply(callback, { ok: false, error: "Your answer time has expired." });
     }
 
     const answer = clean(data.answer, 1).toUpperCase();
 
     if (!["A", "B", "C", "D"].includes(answer)) {
-      return reply(callback, {
-        ok: false,
-        error: "Choose a valid answer."
-      });
-    }
-
-    const question = room.questions[player.currentQuestion];
-
-    if (!question || question.claimedBy !== player.id) {
-      return reply(callback, {
-        ok: false,
-        error: "You no longer own this question."
-      });
+      return reply(callback, { ok: false, error: "Choose A, B, C or D." });
     }
 
     player.answer = answer;
-    player.locked = true;
-    player.status = "Answer locked; optional explanation";
-
-    player.pickDeadline = null;
-    player.explainDeadline = Date.now() + room.explainTime * 1000;
+    player.status = "Answer locked; ready to submit";
 
     reply(callback, { ok: true });
-
     emit(room);
   });
 
-  /* -----------------------------------------------
-     PLAYER SUBMITS ANSWER AND EXPLANATION
-  ------------------------------------------------ */
-
+  // PLAYER SUBMITS — FEEDBACK IS OPTIONAL
   socket.on("player:submit", (data = {}, callback) => {
     const room = findRoom(data.roomId);
     const player = findPlayer(room, socket);
 
     if (!room || !player || room.status !== "playing") {
+      return reply(callback, { ok: false, error: "Active player not found." });
+    }
+
+    if (room.currentTurnPlayerId !== player.id) {
+      return reply(callback, { ok: false, error: "It is not your turn." });
+    }
+
+    if (!player.currentQuestion || !player.answer) {
       return reply(callback, {
         ok: false,
-        error: "Player or active session not found."
+        error: "Choose and lock an answer before submitting."
       });
     }
 
-    if (player.currentQuestion === null) {
-      return reply(callback, {
-        ok: false,
-        error: "There is no active question to submit."
-      });
-    }
+    const question = room.questions.find(
+      q => q.id === player.currentQuestion
+    );
 
-    if (!player.locked) {
-      return reply(callback, {
-        ok: false,
-        error: "Lock your answer before submitting."
-      });
-    }
-
-    if (
-      player.explainDeadline &&
-      Date.now() > player.explainDeadline
-    ) {
-      data.feedback = "";
-    }
-
-    const index = player.currentQuestion;
-    const question = room.questions[index];
-
-    if (
-      !question ||
-      question.claimedBy !== player.id ||
-      question.answered
-    ) {
+    if (!question || question.claimedBy !== player.id || question.answered) {
       return reply(callback, {
         ok: false,
         error: "This question is no longer available."
@@ -791,84 +790,91 @@ io.on("connection", socket => {
     }
 
     const feedback = clean(data.feedback, 4000);
-
     const isCorrect = player.answer === question.correct;
 
-    /*
-     * The question becomes globally answered and unavailable
-     * as soon as the player submits.
-     */
     question.answered = true;
-    question.claimedBy = player.id;
-
-    player.answeredQuestions.push(index);
-    player.feedback = feedback;
-    player.status = "Submitted";
 
     const submission = {
-      name: player.name,
+      id: makeId(),
       playerId: player.id,
-
-      questionIndex: index,
+      name: player.name,
+      questionId: question.id,
+      questionIndex: room.questions.indexOf(question),
       question: question.text,
-
+      options: [...question.options],
       answer: player.answer,
       feedback,
-
       correct: question.correct,
       isCorrect,
-
       marks: 0,
       submittedAt: Date.now()
     };
 
     room.submissions.push(submission);
+    player.answeredQuestions.push(question.id);
+    player.status = "Submitted";
 
-    /*
-     * Clear the player's current question so they can select
-     * another available question, up to their assigned limit.
-     */
     player.currentQuestion = null;
     player.answer = null;
-    player.locked = false;
+    player.feedback = null;
     player.pickDeadline = null;
-    player.explainDeadline = null;
 
     room.current = null;
     room.deadline = null;
 
     reply(callback, {
       ok: true,
-      answeredQuestions: player.answeredQuestions.length,
-      questionLimit: room.perPlayer
+      submissionId: submission.id,
+      feedbackSaved: Boolean(feedback)
     });
 
-    emit(room);
+    // Move to the next player in joining order.
+    advanceTurn(room, player.id);
   });
 
-  /* -----------------------------------------------
-     REFEREE MARKS PLAYER
-  ------------------------------------------------ */
+  // REFEREE OVERRIDES THE CORRECT ANSWER FOR A SUBMISSION
+  socket.on("host:answer:override", (data = {}, callback) => {
+    const room = findRoom(data.roomId);
 
+    if (!isHost(room, socket)) {
+      return reply(callback, { ok: false, error: "Referee only." });
+    }
+
+    const answer = clean(data.correct, 1).toUpperCase();
+
+    if (!["A", "B", "C", "D"].includes(answer)) {
+      return reply(callback, {
+        ok: false,
+        error: "Correct answer must be A, B, C or D."
+      });
+    }
+
+    const submission = room.submissions.find(s => s.id === data.submissionId);
+
+    if (!submission) {
+      return reply(callback, { ok: false, error: "Submission not found." });
+    }
+
+    submission.correct = answer;
+    submission.isCorrect = submission.answer === answer;
+    submission.answerOverridden = true;
+
+    emit(room);
+    reply(callback, { ok: true });
+  });
+
+  // REFEREE MARKS A SPECIFIC SUBMISSION
   socket.on("host:mark", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
     if (!isHost(room, socket)) {
-      return reply(callback, {
-        ok: false,
-        error: "Referee only."
-      });
+      return reply(callback, { ok: false, error: "Referee only." });
     }
 
-    const player = room.players.find(
-      p => p.id === data.playerId
-    );
+    const submission = room.submissions.find(s => s.id === data.submissionId);
 
-    if (!player) {
-      return reply(callback, {
-        ok: false,
-        error: "Player not found."
-      });
+    if (!submission) {
+      return reply(callback, { ok: false, error: "Submission not found." });
     }
 
     const marks = Number(data.marks);
@@ -880,19 +886,10 @@ io.on("connection", socket => {
       });
     }
 
-    /*
-     * Store marks against the latest submission from this player.
-     * This avoids awarding the same marks repeatedly.
-     */
-    const submission = [...room.submissions]
-      .reverse()
-      .find(item => item.playerId === player.id);
+    const player = room.players.find(p => p.id === submission.playerId);
 
-    if (!submission) {
-      return reply(callback, {
-        ok: false,
-        error: "No submission found for this player."
-      });
+    if (!player) {
+      return reply(callback, { ok: false, error: "Player not found." });
     }
 
     const previousMarks = Number(submission.marks || 0);
@@ -901,51 +898,27 @@ io.on("connection", socket => {
     player.score += marks - previousMarks;
 
     emit(room);
-
     reply(callback, { ok: true });
   });
 
-  /* -----------------------------------------------
-     REFEREE ENDS SESSION
-  ------------------------------------------------ */
-
+  // REFEREE ENDS SESSION
   socket.on("host:end", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
     if (!isHost(room, socket)) {
-      return reply(callback, {
-        ok: false,
-        error: "Referee only."
-      });
+      return reply(callback, { ok: false, error: "Referee only." });
     }
 
-    room.status = "finished";
-    room.deadline = null;
-    room.sessionDeadline = null;
-
-    emit(room);
-
+    finishRoom(room);
     reply(callback, { ok: true });
-
-    /*
-     * Keep the finished room record for its results.
-     * Its access code becomes available for a new session
-     * because only non-finished rooms block code reuse.
-     */
   });
 
-  /* -----------------------------------------------
-     RESUME ROOM DATA
-  ------------------------------------------------ */
-
+  // ROOM RESUME FOR ALREADY AUTHENTICATED SOCKET
   socket.on("room:resume", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
     if (!room) {
-      return reply(callback, {
-        ok: false,
-        error: "Room no longer exists."
-      });
+      return reply(callback, { ok: false, error: "Room no longer exists." });
     }
 
     const player = findPlayer(room, socket);
@@ -962,14 +935,11 @@ io.on("connection", socket => {
 
     reply(callback, {
       ok: true,
-      room: view(room)
+      room: host ? refereeView(room) : publicView(room)
     });
   });
 
-  /* -----------------------------------------------
-     DISCONNECT
-  ------------------------------------------------ */
-
+  // DISCONNECT
   socket.on("disconnect", () => {
     for (const room of rooms.values()) {
       if (room.hostSocketId === socket.id) {
@@ -977,31 +947,19 @@ io.on("connection", socket => {
         emit(room);
       }
 
-      const player = room.players.find(
-        p => p.socketId === socket.id
-      );
+      const player = room.players.find(p => p.socketId === socket.id);
 
       if (player) {
         player.connected = false;
         player.socketId = null;
         player.status = "Disconnected";
-
-        /*
-         * Do not delete the player or end the session.
-         * Their submitted questions and score remain.
-         * An unsubmitted claimed question stays reserved
-         * until the player reconnects or the referee kicks them.
-         */
         emit(room);
       }
     }
   });
 });
 
-/* -------------------------------------------------
-   SESSION TIME LIMIT
--------------------------------------------------- */
-
+// SESSION TIMER
 setInterval(() => {
   const now = Date.now();
 
@@ -1011,17 +969,10 @@ setInterval(() => {
       room.sessionDeadline &&
       now >= room.sessionDeadline
     ) {
-      room.status = "finished";
-      room.deadline = null;
-
-      emit(room);
+      finishRoom(room);
     }
   }
 }, 1000);
-
-/* -------------------------------------------------
-   START SERVER
--------------------------------------------------- */
 
 const PORT = process.env.PORT || 3000;
 
