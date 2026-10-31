@@ -595,6 +595,8 @@ io.on("connection", socket => {
   });
 
   // REFEREE EDITS ONE QUESTION
+
+  // REFEREE EDITS ONE QUESTION
   socket.on("host:question:edit", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -605,9 +607,11 @@ io.on("connection", socket => {
       });
     }
 
-    const index = room.questions.findIndex(q => q.id === data.questionId);
+    const index = Number.isInteger(Number(data.index))
+      ? Number(data.index)
+      : room.questions.findIndex(q => q.id === data.questionId);
 
-    if (index < 0) {
+    if (index < 0 || index >= room.questions.length) {
       return reply(callback, { ok: false, error: "Question not found." });
     }
 
@@ -625,6 +629,8 @@ io.on("connection", socket => {
   });
 
   // REFEREE REMOVES ONE QUESTION
+ 
+  // REFEREE REMOVES ONE QUESTION
   socket.on("host:question:delete", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -635,11 +641,20 @@ io.on("connection", socket => {
       });
     }
 
-    room.questions = room.questions.filter(q => q.id !== data.questionId);
+    const index = Number.isInteger(Number(data.index))
+      ? Number(data.index)
+      : room.questions.findIndex(q => q.id === data.questionId);
+
+    if (index < 0 || index >= room.questions.length) {
+      return reply(callback, { ok: false, error: "Question not found." });
+    }
+
+    room.questions.splice(index, 1);
 
     emit(room);
     reply(callback, { ok: true });
   });
+
 
   // START SESSION
   socket.on("host:start", (data = {}, callback) => {
