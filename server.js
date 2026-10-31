@@ -1,4 +1,6 @@
 
+"use strict";
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -117,20 +119,18 @@ function publicView(room) {
       score: p.score,
       approved: p.approved,
       connected: p.connected,
-      status: p.approved
-        ? p.connected ? "Online" : "Offline"
-        : "Waiting for approval",
+      status: p.status,
       answeredCount: p.answeredQuestions.length,
       answeredQuestions: [...p.answeredQuestions],
       isCurrentTurn: room.currentTurnPlayerId === p.id,
 
-      // These fields tell the frontend who can see and claim the bell.
       canBuzz: Boolean(
         room.buzzer &&
         room.buzzer.active &&
         room.buzzer.eligiblePlayerIds.includes(p.id) &&
         !room.buzzer.claimantPlayerId
       ),
+
       isBuzzerPlayer: Boolean(
         room.buzzer &&
         room.buzzer.claimantPlayerId === p.id
@@ -168,17 +168,20 @@ function refereeView(room) {
       approved: p.approved,
       connected: p.connected,
       status: p.status,
+      answeredCount: p.answeredQuestions.length,
       answeredQuestions: [...p.answeredQuestions],
       currentQuestion: p.currentQuestion,
       currentAnswer: p.answer,
       currentFeedback: p.feedback,
       isCurrentTurn: room.currentTurnPlayerId === p.id,
+
       canBuzz: Boolean(
         room.buzzer &&
         room.buzzer.active &&
         room.buzzer.eligiblePlayerIds.includes(p.id) &&
         !room.buzzer.claimantPlayerId
       ),
+
       isBuzzerPlayer: Boolean(
         room.buzzer &&
         room.buzzer.claimantPlayerId === p.id
@@ -219,6 +222,7 @@ function finishRoom(room) {
   room.deadline = null;
   room.sessionDeadline = null;
   room.currentTurnPlayerId = null;
+  room.current = null;
   room.buzzer = null;
 
   room.questions.forEach(q => {
@@ -247,8 +251,6 @@ function startRoom(room) {
   room.status = "playing";
   room.startedAt = Date.now();
   room.turnNumber = 1;
-
-  // The first player to join gets the first turn.
   room.currentTurnPlayerId = room.players[0].id;
 
   room.sessionDeadline = room.duration > 0
@@ -293,6 +295,36 @@ function advanceTurn(room, previousPlayerId) {
   finishRoom(room);
 }
 
+function closeBuzzerQuestion(room, statusMessage) {
+  const buzzer = room.buzzer;
+  if (!buzzer) return;
+
+  const question = room.questions.find(
+    q => q.id === buzzer.questionId
+  );
+
+  if (question) {
+    question.answered = true;
+    question.buzzerActive = false;
+  }
+
+  const claimant = room.players.find(
+    p => p.id === buzzer.claimantPlayerId
+  );
+
+  if (claimant && statusMessage) {
+    claimant.status = statusMessage;
+  }
+
+  const originalPlayerId = buzzer.originalPlayerId;
+
+  room.buzzer = null;
+  room.current = null;
+  room.deadline = null;
+
+  advanceTurn(room, originalPlayerId);
+}
+
 // Start the buzzer round after a player's selection time expires.
 function startBuzzer(room, timedOutPlayer) {
   const question = room.questions.find(
@@ -302,12 +334,12 @@ function startBuzzer(room, timedOutPlayer) {
   if (!question || question.answered) {
     timedOutPlayer.currentQuestion = null;
     timedOutPlayer.answer = null;
+    timedOutPlayer.feedback = null;
     timedOutPlayer.pickDeadline = null;
     advanceTurn(room, timedOutPlayer.id);
     return;
   }
 
-  // Release the question from the player who timed out.
   question.claimedBy = null;
   question.buzzerActive = true;
 
@@ -320,7 +352,6 @@ function startBuzzer(room, timedOutPlayer) {
   room.current = null;
   room.deadline = null;
 
-  // Only approved players other than the player who timed out can buzz.
   const eligiblePlayerIds = room.players
     .filter(p =>
       p.approved &&
@@ -331,6 +362,7 @@ function startBuzzer(room, timedOutPlayer) {
 
   if (!eligiblePlayerIds.length) {
     question.buzzerActive = false;
+    question.answered = true;
     advanceTurn(room, timedOutPlayer.id);
     return;
   }
@@ -341,13 +373,14 @@ function startBuzzer(room, timedOutPlayer) {
     originalPlayerId: timedOutPlayer.id,
     eligiblePlayerIds,
     claimantPlayerId: null,
-    deadline: null
+
+    // FIX: the unclaimed buzzer must also expire.
+    deadline: Date.now() + room.pickTime * 1000
   };
 
   emit(room);
 }
 
-// Record the buzzer answer and award the bonus mark if correct.
 function resolveBuzzer(room, player, answer) {
   const buzzer = room.buzzer;
 
@@ -356,7 +389,7 @@ function resolveBuzzer(room, player, answer) {
     return { ok: false, error: "You do not hold this buzzer question." };
   }
 
-  if (buzzer.deadline && Date.now() > buzzer.deadline) {
+  if (buzzer.deadline && Date.now() >= buzzer.deadline) {
     return { ok: false, error: "Your buzzer answer time has expired." };
   }
 
@@ -376,12 +409,10 @@ function resolveBuzzer(room, player, answer) {
 
   const isCorrect = selectedAnswer === question.correct;
 
-  // The question closes whether the buzzer answer is right or wrong.
   question.answered = true;
   question.buzzerActive = false;
   question.claimedBy = player.id;
 
-  // A correct buzzer answer earns one bonus mark.
   const bonusMarks = isCorrect ? 1 : 0;
   player.score += bonusMarks;
 
@@ -415,7 +446,6 @@ function resolveBuzzer(room, player, answer) {
   room.current = null;
   room.deadline = null;
 
-  // Continue the normal turn order after the buzzer question is resolved.
   advanceTurn(room, originalPlayerId);
 
   return {
@@ -429,7 +459,6 @@ function resolveBuzzer(room, player, answer) {
 
 io.on("connection", socket => {
 
-  // CREATE ROOM
   socket.on("room:create", (data = {}, callback) => {
     const name = clean(data.name, 100) || "Classroom Arena";
     const code = clean(data.code, 30).toUpperCase();
@@ -516,7 +545,6 @@ io.on("connection", socket => {
     emit(room);
   });
 
-  // REFEREE RECONNECT
   socket.on("host:resume", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -547,7 +575,6 @@ io.on("connection", socket => {
     emit(room);
   });
 
-  // PLAYER JOIN OR RESUME
   socket.on("room:join", (data = {}, callback) => {
     const code = clean(data.code, 30).toUpperCase();
     const name = clean(data.name, 50);
@@ -649,7 +676,6 @@ io.on("connection", socket => {
     checkAutomaticStart(room);
   });
 
-  // APPROVE PLAYER
   socket.on("host:approve", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -679,7 +705,6 @@ io.on("connection", socket => {
     emit(room);
   });
 
-  // KICK PLAYER
   socket.on("host:kick", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -695,7 +720,9 @@ io.on("connection", socket => {
 
     const player = room.players[index];
 
-    if (player.currentQuestion) {
+    if (room.buzzer && room.buzzer.claimantPlayerId === player.id) {
+      closeBuzzerQuestion(room, "Buzzer attempt ended — question closed");
+    } else if (player.currentQuestion) {
       const question = room.questions.find(
         q => q.id === player.currentQuestion
       );
@@ -705,26 +732,9 @@ io.on("connection", socket => {
       }
     }
 
-    // Remove a kicked player from any active buzzer eligibility list.
     if (room.buzzer) {
       room.buzzer.eligiblePlayerIds =
         room.buzzer.eligiblePlayerIds.filter(id => id !== player.id);
-
-      if (room.buzzer.claimantPlayerId === player.id) {
-        const question = room.questions.find(
-          q => q.id === room.buzzer.questionId
-        );
-
-        if (question) {
-          question.answered = true;
-          question.buzzerActive = false;
-          question.claimedBy = player.id;
-        }
-
-        const originalPlayerId = room.buzzer.originalPlayerId;
-        room.buzzer = null;
-        advanceTurn(room, originalPlayerId);
-      }
     }
 
     const playerSocket = io.sockets.sockets.get(player.socketId);
@@ -746,7 +756,6 @@ io.on("connection", socket => {
     reply(callback, { ok: true });
   });
 
-  // EDIT OR REPLACE QUESTION BANK BEFORE START
   socket.on("host:questions:update", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -778,7 +787,6 @@ io.on("connection", socket => {
     reply(callback, { ok: true, totalQuestions: room.questions.length });
   });
 
-  // REFEREE ADDS A QUESTION
   socket.on("host:question:add", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -799,7 +807,6 @@ io.on("connection", socket => {
     reply(callback, { ok: true });
   });
 
-  // REFEREE EDITS ONE QUESTION
   socket.on("host:question:edit", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -831,7 +838,6 @@ io.on("connection", socket => {
     reply(callback, { ok: true });
   });
 
-  // REFEREE REMOVES ONE QUESTION
   socket.on("host:question:delete", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -856,7 +862,6 @@ io.on("connection", socket => {
     reply(callback, { ok: true });
   });
 
-  // START SESSION
   socket.on("host:start", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -868,7 +873,6 @@ io.on("connection", socket => {
     reply(callback, result);
   });
 
-  // PLAYER CLAIMS A QUESTION ON THEIR TURN
   socket.on("player:pick", (data = {}, callback) => {
     const room = findRoom(data.roomId);
     const player = findPlayer(room, socket);
@@ -946,7 +950,6 @@ io.on("connection", socket => {
     emit(room);
   });
 
-  // PLAYER LOCKS SELECTED OPTION
   socket.on("player:lock", (data = {}, callback) => {
     const room = findRoom(data.roomId);
     const player = findPlayer(room, socket);
@@ -963,7 +966,7 @@ io.on("connection", socket => {
       return reply(callback, { ok: false, error: "No answer is waiting to be locked." });
     }
 
-    if (Date.now() > player.pickDeadline) {
+    if (Date.now() >= player.pickDeadline) {
       return reply(callback, { ok: false, error: "Your answer time has expired." });
     }
 
@@ -980,7 +983,6 @@ io.on("connection", socket => {
     emit(room);
   });
 
-  // PLAYER SUBMITS — FEEDBACK IS OPTIONAL
   socket.on("player:submit", (data = {}, callback) => {
     const room = findRoom(data.roomId);
     const player = findPlayer(room, socket);
@@ -1053,7 +1055,6 @@ io.on("connection", socket => {
     advanceTurn(room, player.id);
   });
 
-  // FIRST ELIGIBLE PLAYER TO CLICK THE GREEN BUZZER WINS THE CLAIM
   socket.on("player:buzzer:claim", (data = {}, callback) => {
     const room = findRoom(data.roomId);
     const player = findPlayer(room, socket);
@@ -1068,6 +1069,13 @@ io.on("connection", socket => {
       return reply(callback, {
         ok: false,
         error: "The buzzer is no longer available."
+      });
+    }
+
+    if (buzzer.deadline && Date.now() >= buzzer.deadline) {
+      return reply(callback, {
+        ok: false,
+        error: "The buzzer time has expired."
       });
     }
 
@@ -1093,8 +1101,7 @@ io.on("connection", socket => {
       });
     }
 
-    // This assignment happens synchronously on the server.
-    // Only the first valid click can become the claimant.
+    // The server processes this synchronously; the first valid click wins.
     buzzer.claimantPlayerId = player.id;
     buzzer.deadline = Date.now() + room.pickTime * 1000;
 
@@ -1112,7 +1119,6 @@ io.on("connection", socket => {
     emit(room);
   });
 
-  // BUZZER PLAYER SUBMITS AN ANSWER
   socket.on("player:buzzer:submit", (data = {}, callback) => {
     const room = findRoom(data.roomId);
     const player = findPlayer(room, socket);
@@ -1125,7 +1131,6 @@ io.on("connection", socket => {
     reply(callback, result);
   });
 
-  // REFEREE OVERRIDES THE CORRECT ANSWER FOR A SUBMISSION
   socket.on("host:answer:override", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -1156,7 +1161,6 @@ io.on("connection", socket => {
     reply(callback, { ok: true });
   });
 
-  // REFEREE MARKS A SPECIFIC SUBMISSION
   socket.on("host:mark", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -1194,7 +1198,6 @@ io.on("connection", socket => {
     reply(callback, { ok: true });
   });
 
-  // REFEREE ENDS SESSION
   socket.on("host:end", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -1206,7 +1209,6 @@ io.on("connection", socket => {
     reply(callback, { ok: true });
   });
 
-  // ROOM RESUME FOR ALREADY AUTHENTICATED SOCKET
   socket.on("room:resume", (data = {}, callback) => {
     const room = findRoom(data.roomId);
 
@@ -1232,7 +1234,6 @@ io.on("connection", socket => {
     });
   });
 
-  // DISCONNECT
   socket.on("disconnect", () => {
     for (const room of rooms.values()) {
       if (room.hostSocketId === socket.id) {
@@ -1247,13 +1248,11 @@ io.on("connection", socket => {
         player.socketId = null;
         player.status = "Disconnected";
 
-        // A disconnected player cannot claim a buzzer.
         if (room.buzzer && room.buzzer.active) {
           room.buzzer.eligiblePlayerIds =
             room.buzzer.eligiblePlayerIds.filter(id => id !== player.id);
 
-          // If the player had already claimed it, leave the claim in place.
-          // The buzzer answer timer will resolve the unanswered attempt.
+          // A disconnected buzzer claimant remains claimant until timeout.
         }
 
         emit(room);
@@ -1269,45 +1268,36 @@ setInterval(() => {
   for (const room of rooms.values()) {
     if (room.status !== "playing") continue;
 
-    // End the session when its overall time expires.
     if (room.sessionDeadline && now >= room.sessionDeadline) {
       finishRoom(room);
       continue;
     }
 
-    // If a buzzer claimant does not answer in time, close the question.
+    // Buzzer phase: close if nobody claims before the deadline.
+    if (
+      room.buzzer &&
+      !room.buzzer.claimantPlayerId &&
+      room.buzzer.deadline &&
+      now >= room.buzzer.deadline
+    ) {
+      closeBuzzerQuestion(room, null);
+      continue;
+    }
+
+    // Buzzer winner: close if their answer time expires.
     if (
       room.buzzer &&
       room.buzzer.claimantPlayerId &&
       room.buzzer.deadline &&
       now >= room.buzzer.deadline
     ) {
-      const buzzer = room.buzzer;
-      const question = room.questions.find(
-        q => q.id === buzzer.questionId
+      closeBuzzerQuestion(
+        room,
+        "Buzzer time expired — question closed"
       );
-
-      if (question) {
-        question.answered = true;
-        question.buzzerActive = false;
-      }
-
-      const claimant = room.players.find(
-        p => p.id === buzzer.claimantPlayerId
-      );
-
-      if (claimant) {
-        claimant.status = "Buzzer time expired — question closed";
-      }
-
-      const originalPlayerId = buzzer.originalPlayerId;
-      room.buzzer = null;
-
-      advanceTurn(room, originalPlayerId);
       continue;
     }
 
-    // Handle a player's normal answer-selection time expiring.
     const player = room.players.find(
       p => p.id === room.currentTurnPlayerId
     );
