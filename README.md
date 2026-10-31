@@ -1,8 +1,1 @@
-# Classroom Arena starter
-Node.js + Express + Socket.IO multiplayer quiz starter.
-
-Features: referee creates room, players join by code, referee enters MCQ questions as JSON, players answer once, live scores and next-question control.
-
-Limitations: room data is held in memory and is lost on restart. This is an early starter, not the full requested product; it does not yet have PDF import, player approval, timers, explanations, buzzer, persistence, or resume.
-
-Render settings: Web Service, Node runtime, build command `npm install`, start command `npm start`.
+Classroom Arena prototype-based starter. Render build: npm install; start: npm start. Server uses Socket.IO for shared live room state. Room state is in memory and is lost when Render restarts; add persistent storage before production use. PDF extraction/AI generation and secure referee authentication are not implemented yet.
