@@ -1,12 +1,181 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Classroom Arena</title><link rel="stylesheet" href="/style.css"></head><body>
-<header><b>Classroom Arena</b><span id="headerStatus">No active room</span></header><main>
-<section id="home" class="panel"><h1>Welcome to Classroom Arena</h1><p>Referee creates a room and shares the player code.</p><button id="refStart">Enter as Referee</button> <button class="secondary" id="playerStart">Enter as Player</button></section>
-<section id="auth" class="panel hidden"><h2>Referee authentication</h2><label>Referee password</label><input id="password" type="password" placeholder="Set by your group"><p class="hint">Demo password: 1144 (temporary prototype only)</p><button id="authBtn">Continue</button> <button class="secondary" id="backHome">Back</button></section>
-<section id="setup" class="panel hidden"><h2>Create a group room</h2><div class="grid">
-<label>Group name<input id="roomName" value="Biology Study Group"></label><label>Player access code<input id="accessCode" value="1144A"></label><label>Session duration (minutes)<input id="duration" type="number" value="120" min="1"></label><label>Answer selection (seconds)<input id="pickTime" type="number" value="60" min="10"></label><label>Explanation (seconds)<input id="explainTime" type="number" value="120" min="10"></label></div>
-<h3>Question bank</h3><p class="hint">Add/edit multiple-choice questions. PDF extraction and AI generation are not connected yet.</p><div id="bank"></div><button class="secondary" id="addQuestion">Add question</button> <button id="createRoom">Approve code & open room</button></section>
-<section id="join" class="panel hidden"><h2>Join your group</h2><label>Your name<input id="playerName" placeholder="Enter your name"></label><label>Player access code<input id="joinCode" placeholder="Code from referee"></label><button id="joinBtn">Join room</button> <button class="secondary" id="backHome2">Back</button></section>
-<section id="refDash" class="hidden"><div class="panel"><div class="between"><div><h1 id="dashName">Referee dashboard</h1><p>Share code: <b id="shareCode"></b> · Room ID: <b id="roomId"></b></p><p>Session: <b id="sessionClock">Waiting to start</b></p></div><button class="secondary" id="endSession">End session</button></div></div><div class="panel"><h2>Player monitoring</h2><div id="monitor"></div></div><div class="panel"><h2>Question review & marking</h2><div id="marking"></div></div></section>
-<section id="playerDash" class="hidden"><div class="panel"><h1 id="playerRoom"></h1><p>Room <b id="playerRoomId"></b> · <b id="playerIdentity"></b></p><p id="phase">Waiting for referee.</p></div><div class="grid"><div class="panel"><h2>Question board</h2><div id="tiles"></div><div id="questionArea"></div></div><div class="panel"><h2>Leaderboard</h2><div id="leaderboard"></div></div></div></section>
-<section id="finished" class="panel hidden"><h1>Session finished</h1><div id="results"></div><button id="homeBtn">Back home</button></section><p id="message" role="status"></p></main>
-<script src="/socket.io/socket.io.js"></script><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Classroom Arena</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <b>Classroom Arena</b>
+  <span id="headerStatus">No active room</span>
+</header>
+
+<main>
+  <section id="home" class="panel">
+    <h1>Welcome to Classroom Arena</h1>
+    <p>Referee creates a room and shares the player code.</p>
+    <button id="refStart">Enter as Referee</button>
+    <button class="secondary" id="playerStart">Enter as Player</button>
+  </section>
+
+  <section id="auth" class="panel hidden">
+    <h2>Referee authentication</h2>
+    <label for="password">Referee password</label>
+    <input id="password" type="password" placeholder="Set by your group">
+    <p class="hint">Demo password: 1144 (temporary prototype only)</p>
+    <button id="authBtn">Continue</button>
+    <button class="secondary" id="backHome">Back</button>
+  </section>
+
+  <section id="setup" class="panel hidden">
+    <h2>Create a group room</h2>
+
+    <div class="grid">
+      <label for="roomName">
+        Group name
+        <input id="roomName" value="Biology Study Group">
+      </label>
+
+      <label for="accessCode">
+        Player access code
+        <input id="accessCode" value="1144A">
+      </label>
+
+      <label for="playerCount">
+        Number of students
+        <input id="playerCount" type="number" value="3" min="1" step="1">
+      </label>
+
+      <label for="totalQuestions">
+        Total questions
+        <input id="totalQuestions" type="number" value="30" min="1" step="1">
+      </label>
+
+      <label for="duration">
+        Session duration (minutes)
+        <input id="duration" type="number" value="120" min="1">
+      </label>
+
+      <label for="pickTime">
+        Answer selection (seconds)
+        <input id="pickTime" type="number" value="60" min="10">
+      </label>
+
+      <label for="explainTime">
+        Explanation (seconds)
+        <input id="explainTime" type="number" value="120" min="10">
+      </label>
+    </div>
+
+    <p id="questionDistribution" class="hint">
+      Set the number of students and total questions to see each student's question limit.
+    </p>
+
+    <label for="autoStart">
+      <input id="autoStart" type="checkbox">
+      Start automatically when all students have joined and been approved
+    </label>
+
+    <h3>Question bank</h3>
+    <p class="hint">
+      Add or edit questions before starting. The full question bank will be visible to
+      every player. Each student may answer up to their assigned maximum. A question
+      answered by one student becomes unavailable to everyone else.
+    </p>
+
+    <div id="bank"></div>
+
+    <button class="secondary" id="addQuestion">Add question</button>
+    <button id="createRoom">Approve code &amp; open room</button>
+  </section>
+
+  <section id="join" class="panel hidden">
+    <h2>Join your group</h2>
+
+    <label for="playerName">
+      Your name
+      <input id="playerName" placeholder="Enter your name">
+    </label>
+
+    <label for="joinCode">
+      Player access code
+      <input id="joinCode" placeholder="Code from referee">
+    </label>
+
+    <button id="joinBtn">Join room</button>
+    <button class="secondary" id="backHome2">Back</button>
+  </section>
+
+  <section id="refDash" class="hidden">
+    <div class="panel">
+      <div class="between">
+        <div>
+          <h1 id="dashName">Referee dashboard</h1>
+          <p>
+            Share code: <b id="shareCode"></b>
+            · Room ID: <b id="roomId"></b>
+          </p>
+          <p>Session: <b id="sessionClock">Waiting to start</b></p>
+        </div>
+        <button class="secondary" id="endSession">End session</button>
+      </div>
+
+      <div class="actions">
+        <button id="startNow">Start session now</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Player monitoring</h2>
+      <div id="monitor"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Question review &amp; marking</h2>
+      <div id="marking"></div>
+    </div>
+  </section>
+
+  <section id="playerDash" class="hidden">
+    <div class="panel">
+      <h1 id="playerRoom"></h1>
+      <p>
+        Room <b id="playerRoomId"></b>
+        · <b id="playerIdentity"></b>
+      </p>
+      <p id="phase">Waiting for referee.</p>
+      <p id="playerQuestionLimit"></p>
+    </div>
+
+    <div class="grid">
+      <div class="panel">
+        <h2>Question board</h2>
+        <p class="hint">
+          Choose any available question. Answered questions appear inactive to all players.
+        </p>
+        <div id="tiles"></div>
+        <div id="questionArea"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Leaderboard</h2>
+        <div id="leaderboard"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="finished" class="panel hidden">
+    <h1>Session finished</h1>
+    <div id="results"></div>
+    <button id="homeBtn">Back home</button>
+  </section>
+
+  <p id="message" role="status"></p>
+</main>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
