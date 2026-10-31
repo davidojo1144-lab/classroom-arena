@@ -22,6 +22,7 @@ let buzzerQuestion = null;
 let buzzerAnswer = null;
 let buzzerLocked = false;
 let buzzerSubmitting = false;
+let playerResumeAttempted = false;
 
 const screens = [
   "home", "auth", "setup", "join",
@@ -416,6 +417,44 @@ $("createRoom")?.addEventListener("click", () => {
    PLAYER JOIN AND RESUME
 -------------------------------------------------- */
 
+function joinPlayerRoom(code, name, savedToken, isResume = false) {
+  socket.emit("room:join", {
+    code,
+    name,
+    resumeToken: savedToken || undefined
+  }, response => {
+    if (!response?.ok) {
+      if (isResume) {
+        say("Your previous player session could not be restored. You can try joining again.");
+      } else {
+        say(response?.error || "Unable to join the room.");
+      }
+      return;
+    }
+
+    room = response.room;
+    role = "player";
+    playerId = response.playerId;
+    playerToken = response.resumeToken || savedToken || "";
+    playerName = name;
+
+    if (playerToken) {
+      localStorage.setItem("classroomArenaPlayerToken", playerToken);
+      localStorage.setItem("classroomArenaPlayerRoomCode", code);
+      localStorage.setItem("classroomArenaPlayerName", name);
+    }
+
+    $("playerRoom").textContent = room.name || "";
+    $("playerRoomId").textContent = room.id || "";
+    $("playerIdentity").textContent = name;
+
+    updateHeader();
+    say(isResume ? "Your player session has been restored." : "");
+    show("playerDash");
+    renderRoom(room);
+  });
+}
+
 $("joinBtn")?.addEventListener("click", () => {
   playerName = $("playerName")?.value.trim() || "";
   const code = $("joinCode")?.value.trim().toUpperCase() || "";
@@ -433,37 +472,23 @@ $("joinBtn")?.addEventListener("click", () => {
   const savedToken = localStorage.getItem("classroomArenaPlayerToken") || "";
 
   say("Requesting to join the room...");
+  joinPlayerRoom(code, playerName, savedToken, false);
+});
 
-  socket.emit("room:join", {
-    code,
-    name: playerName,
-    resumeToken: savedToken || undefined
-  }, response => {
-    if (!response?.ok) {
-      say(response?.error || "Unable to join the room.");
-      return;
-    }
+function attemptPlayerResume() {
+  if (playerResumeAttempted || room || role) return;
 
-    room = response.room;
-    role = "player";
-    playerId = response.playerId;
-    playerToken = response.resumeToken || "";
+  const code = localStorage.getItem("classroomArenaPlayerRoomCode");
+  const name = localStorage.getItem("classroomArenaPlayerName");
+  const token = localStorage.getItem("classroomArenaPlayerToken");
 
-    if (playerToken) {
-      localStorage.setItem("classroomArenaPlayerToken", playerToken);
-      localStorage.setItem("classroomArenaPlayerRoomCode", code);
-      localStorage.setItem("classroomArenaPlayerName", playerName);
-    }
+  if (!code || !name || !token) return;
 
-    $("playerRoom").textContent = room.name || "";
-    $("playerRoomId").textContent = room.id || "";
-    $("playerIdentity").textContent = playerName;
+  playerResumeAttempted = true;
+  playerName = name;
 
-    updateHeader();
-    say("");
-    show("playerDash");
-    renderRoom(room);
-  });
+  say("Restoring your previous player session...");
+  joinPlayerRoom(code, name, token, true);
 });
 
 /* -------------------------------------------------
@@ -474,13 +499,19 @@ function attemptHostResume() {
   const savedRoomId = localStorage.getItem("classroomArenaHostRoomId");
   const savedToken = localStorage.getItem("classroomArenaHostToken");
 
-  if (!savedRoomId || !savedToken) return;
+  if (!savedRoomId || !savedToken) {
+    attemptPlayerResume();
+    return;
+  }
 
   socket.emit("host:resume", {
     roomId: savedRoomId,
     hostToken: savedToken
   }, response => {
-    if (!response?.ok || !response.room) return;
+    if (!response?.ok || !response.room) {
+      attemptPlayerResume();
+      return;
+    }
 
     room = response.room;
     role = "host";
@@ -1507,8 +1538,6 @@ socket.on("room:update", updatedRoom => {
   if (role === "player") {
     const player = getPlayer();
 
-    // Clear a normal question if its selection timer expired.
-    // The server releases it and starts the buzzer round.
     if (
       activeIndex !== null &&
       room.buzzer?.active &&
@@ -1524,7 +1553,6 @@ socket.on("room:update", updatedRoom => {
       }
     }
 
-    // Clear the old buzzer display once the buzzer round is over.
     if (!room.buzzer?.active && buzzerQuestion) {
       buzzerQuestion = null;
       buzzerAnswer = null;
@@ -1532,7 +1560,6 @@ socket.on("room:update", updatedRoom => {
       buzzerSubmitting = false;
     }
 
-    // Clear a normal question if another update shows it has closed.
     if (activeIndex !== null) {
       const question = room.questions?.[activeIndex];
 
