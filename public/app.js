@@ -487,10 +487,9 @@ function attemptPlayerResume() {
   playerResumeAttempted = true;
   playerName = name;
 
-  say("Restoring your previous player session...");
+   say("Restoring your previous player session...");
   joinPlayerRoom(code, name, token, true);
-});
-
+}
 /* -------------------------------------------------
    REFEREE RESUME
 -------------------------------------------------- */
