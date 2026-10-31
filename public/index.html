@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -6,6 +7,7 @@
   <title>Classroom Arena</title>
   <link rel="stylesheet" href="/style.css">
 </head>
+
 <body>
 <header>
   <b>Classroom Arena</b>
@@ -13,44 +15,48 @@
 </header>
 
 <main>
+
+  <!-- HOME -->
   <section id="home" class="panel">
     <h1>Welcome to Classroom Arena</h1>
-    <p>Referee creates a room and shares the player code.</p>
+    <p>Compete, learn and test your knowledge.</p>
     <button id="refStart">Enter as Referee</button>
     <button class="secondary" id="playerStart">Enter as Player</button>
   </section>
 
+  <!-- REFEREE AUTH -->
   <section id="auth" class="panel hidden">
     <h2>Referee authentication</h2>
+
     <label for="password">Referee password</label>
-    <input id="password" type="password" placeholder="Set by your group">
-    <p class="hint">Demo password: 1144 (temporary prototype only)</p>
+    <input id="password" type="password" placeholder="Referee password">
+
+    <p class="hint">
+      Demo password: 1144. Replace this with secure authentication before production.
+    </p>
+
     <button id="authBtn">Continue</button>
     <button class="secondary" id="backHome">Back</button>
   </section>
 
+  <!-- ROOM SETUP -->
   <section id="setup" class="panel hidden">
-    <h2>Create a group room</h2>
+    <h2>Create a competition</h2>
 
     <div class="grid">
       <label for="roomName">
-        Group name
+        Group or competition name
         <input id="roomName" value="Biology Study Group">
       </label>
 
       <label for="accessCode">
-        Player access code
-        <input id="accessCode" value="1144A">
+        Room number / player access code
+        <input id="accessCode" placeholder="Create a unique room number">
       </label>
 
       <label for="playerCount">
-        Number of students
+        Expected number of players
         <input id="playerCount" type="number" value="3" min="1" step="1">
-      </label>
-
-      <label for="totalQuestions">
-        Total questions
-        <input id="totalQuestions" type="number" value="30" min="1" step="1">
       </label>
 
       <label for="duration">
@@ -59,40 +65,87 @@
       </label>
 
       <label for="pickTime">
-        Answer selection (seconds)
+        Answer selection time (seconds)
         <input id="pickTime" type="number" value="60" min="10">
       </label>
 
       <label for="explainTime">
-        Explanation (seconds)
-        <input id="explainTime" type="number" value="120" min="10">
+        Optional explanation time (seconds)
+        <input id="explainTime" type="number" value="120" min="0">
       </label>
     </div>
 
-    <p id="questionDistribution" class="hint">
-      Set the number of students and total questions to see each student's question limit.
-    </p>
-
     <label for="autoStart">
       <input id="autoStart" type="checkbox">
-      Start automatically when all students have joined and been approved
+      Automatically start when all expected players have joined and been approved
     </label>
 
-    <h3>Question bank</h3>
+    <hr>
+
+    <!-- QUESTION GENERATION -->
+    <h2>Question generator</h2>
+
     <p class="hint">
-      Add or edit questions before starting. The full question bank will be visible to
-      every player. Each student may answer up to their assigned maximum. A question
-      answered by one student becomes unavailable to everyone else.
+      Generate questions from a topic or learning material. The number of questions
+      is independent of the number of players.
     </p>
+
+    <label for="questionTopic">
+      Subject or topic
+      <input id="questionTopic" placeholder="Example: Cell biology, microbiology, genetics">
+    </label>
+
+    <label for="questionCount">
+      Number of questions to generate
+      <input id="questionCount" type="number" min="1" value="30">
+    </label>
+
+    <label for="questionDifficulty">
+      Difficulty level
+      <select id="questionDifficulty">
+        <option value="mixed">Mixed difficulty</option>
+        <option value="easy">Easy</option>
+        <option value="medium">Medium</option>
+        <option value="hard">Hard</option>
+      </select>
+    </label>
+
+    <label for="questionSource">
+      Upload a learning material (optional)
+      <input id="questionSource" type="file" accept=".pdf,.txt,.doc,.docx">
+    </label>
+
+    <button id="generateQuestions">Generate questions</button>
+
+    <p id="generationStatus" class="hint">
+      Generated questions will appear below for referee review.
+    </p>
+
+    <hr>
+
+    <!-- QUESTION EDITOR -->
+    <h2>Review and edit question bank</h2>
+
+    <p class="hint">
+      Review every generated question before starting. You can add, edit or remove
+      questions, change answer options and correct answers, and choose any number
+      of questions. Players will see all available question numbers and select
+      their own questions when it is their turn.
+    </p>
+
+    <div class="between">
+      <b>Total questions: <span id="bankCount">0</span></b>
+      <button class="secondary" id="addQuestion">Add question manually</button>
+    </div>
 
     <div id="bank"></div>
 
-    <button class="secondary" id="addQuestion">Add question</button>
-    <button id="createRoom">Approve code &amp; open room</button>
+    <button id="createRoom">Create room</button>
   </section>
 
+  <!-- PLAYER JOIN -->
   <section id="join" class="panel hidden">
-    <h2>Join your group</h2>
+    <h2>Join competition</h2>
 
     <label for="playerName">
       Your name
@@ -100,25 +153,52 @@
     </label>
 
     <label for="joinCode">
-      Player access code
-      <input id="joinCode" placeholder="Code from referee">
+      Room number
+      <input id="joinCode" placeholder="Enter room number from referee">
     </label>
+
+    <hr>
+
+    <!-- CAMERA CONSENT -->
+    <h3>Webcam participation</h3>
+
+    <p>
+      Classroom Arena may use your webcam to record your participation during
+      the competition for later review by the referee.
+    </p>
+
+    <label>
+      <input id="cameraConsent" type="checkbox">
+      I understand and consent to webcam recording during this session.
+    </label>
+
+    <p class="hint">
+      Your camera should show a visible recording indicator whenever recording
+      is active. You may decline webcam recording if the competition permits it.
+    </p>
 
     <button id="joinBtn">Join room</button>
     <button class="secondary" id="backHome2">Back</button>
   </section>
 
+  <!-- REFEREE DASHBOARD -->
   <section id="refDash" class="hidden">
+
     <div class="panel">
       <div class="between">
         <div>
           <h1 id="dashName">Referee dashboard</h1>
+
           <p>
-            Share code: <b id="shareCode"></b>
+            Room number: <b id="shareCode"></b>
             · Room ID: <b id="roomId"></b>
           </p>
-          <p>Session: <b id="sessionClock">Waiting to start</b></p>
+
+          <p>
+            Session: <b id="sessionClock">Waiting to start</b>
+          </p>
         </div>
+
         <button class="secondary" id="endSession">End session</button>
       </div>
 
@@ -127,55 +207,104 @@
       </div>
     </div>
 
+    <!-- JOIN REQUESTS -->
     <div class="panel">
-      <h2>Player monitoring</h2>
+      <h2>Player approval</h2>
+      <p class="hint">
+        Approve players before they participate. You can remove a player if necessary.
+      </p>
+      <div id="approvalList"></div>
+    </div>
+
+    <!-- LIVE MONITOR -->
+    <div class="panel">
+      <h2>Live player monitoring</h2>
       <div id="monitor"></div>
     </div>
 
+    <!-- PLAYER PROFILES -->
     <div class="panel">
-      <h2>Question review &amp; marking</h2>
+      <h2>Individual player profiles</h2>
+      <p class="hint">
+        Open a player's profile to review their participation, answers,
+        explanations, marks and available webcam recordings.
+      </p>
+      <div id="playerProfiles"></div>
+    </div>
+
+    <!-- SUBMISSION REVIEW -->
+    <div class="panel">
+      <h2>Question review and marking</h2>
       <div id="marking"></div>
     </div>
+
   </section>
 
+  <!-- PLAYER DASHBOARD -->
   <section id="playerDash" class="hidden">
+
     <div class="panel">
       <h1 id="playerRoom"></h1>
+
       <p>
         Room <b id="playerRoomId"></b>
-        · <b id="playerIdentity"></b>
+        · Player <b id="playerIdentity"></b>
       </p>
-      <p id="phase">Waiting for referee.</p>
-      <p id="playerQuestionLimit"></p>
+
+      <p id="phase">Waiting for referee approval.</p>
+
+      <h3 id="turnIndicator">Waiting for your turn</h3>
+
+      <p id="playerProgress"></p>
+
+      <p id="cameraStatus">Camera not active</p>
+
+      <div id="cameraPreviewContainer" class="hidden">
+        <video id="cameraPreview" autoplay muted playsinline></video>
+        <p class="hint">Your webcam preview</p>
+      </div>
     </div>
 
     <div class="grid">
+
+      <!-- QUESTION BOARD -->
       <div class="panel">
         <h2>Question board</h2>
+
         <p class="hint">
-          Choose any available question. Answered questions appear inactive to all players.
+          Select any available question number when it is your turn.
+          Questions claimed by another player or already answered cannot be selected.
         </p>
+
         <div id="tiles"></div>
+
         <div id="questionArea"></div>
       </div>
 
+      <!-- LEADERBOARD -->
       <div class="panel">
-        <h2>Leaderboard</h2>
+        <h2>Live leaderboard</h2>
+        <p class="hint">Standings update as the referee awards marks.</p>
         <div id="leaderboard"></div>
       </div>
+
     </div>
   </section>
 
+  <!-- FINISHED -->
   <section id="finished" class="panel hidden">
-    <h1>Session finished</h1>
+    <h1>Competition finished</h1>
+    <p>The final competition standings are below.</p>
     <div id="results"></div>
     <button id="homeBtn">Back home</button>
   </section>
 
   <p id="message" role="status"></p>
+
 </main>
 
 <script src="/socket.io/socket.io.js"></script>
 <script src="/app.js"></script>
+
 </body>
 </html>
