@@ -163,18 +163,19 @@
     <h3>Webcam participation</h3>
 
     <p>
-      Classroom Arena may use your webcam to record your participation during
-      the competition for later review by the referee.
+      If webcam recording is enabled for this competition, your webcam may
+      be used to record your participation for later review by the referee.
     </p>
 
     <label>
       <input id="cameraConsent" type="checkbox">
-      I understand and consent to webcam recording during this session.
+      I understand and consent to webcam recording if it is enabled for this session.
     </label>
 
     <p class="hint">
-      Your camera should show a visible recording indicator whenever recording
-      is active. You may decline webcam recording if the competition permits it.
+      Recording must be visible while active. You may decline webcam recording
+      if the competition permits it. Your camera will not be recorded without
+      your consent.
     </p>
 
     <button id="joinBtn">Join room</button>
@@ -227,7 +228,7 @@
       <h2>Individual player profiles</h2>
       <p class="hint">
         Open a player's profile to review their participation, answers,
-        explanations, marks and available webcam recordings.
+        explanations, marks and any available webcam recordings.
       </p>
       <div id="playerProfiles"></div>
     </div>
@@ -274,9 +275,14 @@
         <p class="hint">
           Select any available question number when it is your turn.
           Questions claimed by another player or already answered cannot be selected.
+          If a player's selection time expires, eligible players may compete
+          for that question using the buzzer.
         </p>
 
         <div id="tiles"></div>
+
+        <!-- GREEN BUZZER APPEARS HERE -->
+        <div id="buzzerArea"></div>
 
         <div id="questionArea"></div>
       </div>
